@@ -101,7 +101,7 @@ plot.cmd("set size 0.45, 0.92; set origin 0.55, 0");
 plot.cmd("unset key; unset grid; unset tics; unset border; unset xlabel");
 plot.cmd("set title 'Breaks when TLS < 1.2 is switched off' font ',11'");
 plot.cmd("set xrange [0:10]; set yrange [10:0]");
-plot.cmd("set label 21 'SNI (ClientHellos)' at 0.3, 0.8 font ',10,Bold'");
+plot.cmd("set label 21 'SNI (ClientHellos)' at 0.3, 0.8 font ',10'");
 plot.cmd("set label 22 'devices: 10.1.9.5 printer (TLS 1.0)' at 0.3, 5.2 font ',10'");
 plot.cmd("set label 23 '10.1.9.7 HVAC controller (TLS 1.1)' at 1.15, 6.0 font ',10'");
 plot.cmd("set label 24 '10.1.9.9 NAS backup (TLS 1.0)' at 1.15, 6.8 font ',10'");
