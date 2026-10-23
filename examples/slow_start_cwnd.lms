@@ -150,7 +150,7 @@ plot.cmd("set xlabel 'Time since SYN (s)'");
 plot.cmd("set ylabel 'Bytes in flight (segments)'");
 plot.cmd("set arrow 2 from 0, 120 to 6.05, 120 nohead dt 2 lw 1.5 lc rgb '#cf222e'");
 plot.cmd("unset key");
-plot.cmd("set label 3 'red markers: fast retransmission, window halves' at 2.75, 156 left tc rgb '#cf222e' font ',9'");
+plot.cmd("set label 3 'red markers: fast retransmit, window halves' at 0.55, 150 left tc rgb '#cf222e' font ',9'");
 plot.cmd("set label 4 'measured bytes in flight' at 3.3, 72 left tc rgb '#0969da' font ',9'");
 plot.cmd("plot 'build/examples/cwnd_flight.csv' every ::1 using 1:($2/1448.0) with points pt 7 ps 0.25 lc rgb '#0969da' title 'bytes in flight / MSS', '' every ::1 using (strcol(3) eq 'true' ? $1 : 1/0):(172) with points pt 11 ps 1.8 lc rgb '#cf222e' title 'fast retransmission (window halves)'");
 plot.cmd("unset multiplot");
