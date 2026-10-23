@@ -1,0 +1,34 @@
+mkdir("build/tests");
+p = _dsl_ cli="lmshark" install="github:lmctl-ai/lmshark@latest";
+let c1 = shark.capture();
+c1.dns_query(0.100, "10.0.1.10", 53010, "8.8.4.4", 777, "service.internal", "A");
+c1.dns_response(0.115, "8.8.4.4", "10.0.1.10", 53010, 777, "service.internal", "A", "10.0.2.50", 0);
+
+let c2 = shark.capture();
+c2.tcp_handshake(0.120, "10.0.1.10", 49100, "10.0.2.50", 80, 0.010);
+c2.http_request(0.135, "10.0.1.10", 49100, "10.0.2.50", 80, 1001, 5001, "GET", "/healthz", "service.internal", "");
+c2.http_response(0.145, "10.0.2.50", 80, "10.0.1.10", 49100, 5001, 1072, 200, "OK", "text/plain", "healthy");
+
+let merged = c1.merge(c2);
+assert_eq(merged.packet_count(), 7);
+assert_close(merged.duration(), 0.045, 0.0001);
+
+merged.save_pcap("build/tests/test_io.pcap");
+merged.save_pcapng("build/tests/test_io.pcapng");
+
+let r_pcap = shark.open("build/tests/test_io.pcap");
+let r_pcapng = shark.open("build/tests/test_io.pcapng");
+
+assert_eq(r_pcap.packet_count(), 7);
+assert_eq(r_pcapng.packet_count(), 7);
+assert_eq(r_pcap.total_bytes(), merged.total_bytes());
+assert_eq(r_pcapng.total_bytes(), merged.total_bytes());
+assert_eq(r_pcapng.pkt_field(1, "dns.answer"), "10.0.2.50");
+assert_eq(r_pcapng.pkt_field(6, "http.status"), "200");
+
+let sliced = r_pcapng.slice_time(0.120, 0.140);
+assert_eq(sliced.packet_count(), 4);
+end _dsl_
+savedsl(p, "build/tests/pcap_io.dslb");
+r = system ${dsl_cli(p)} --dsl build/tests/pcap_io.dslb;
+assert(r.code == 0);

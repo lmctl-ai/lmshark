@@ -1,0 +1,94 @@
+mkdir("build/tests");
+p = _dsl_ cli="lmshark" install="github:lmctl-ai/lmshark@latest";
+let cap = shark.capture();
+
+# 1. VLAN 250 + ARP Request & Reply
+cap.set_vlan(250);
+cap.arp_request(0.001, "02:00:00:aa:bb:01", "10.20.0.10", "10.20.0.1");
+cap.arp_reply(0.002, "02:00:00:aa:bb:fe", "10.20.0.1", "02:00:00:aa:bb:01", "10.20.0.10");
+cap.clear_vlan();
+
+assert_eq(cap.pkt_proto(0), "ARP");
+assert_eq(cap.pkt_vlan(0), 250);
+assert_eq(cap.pkt_field(0, "arp.opcode"), "1");
+assert_eq(cap.pkt_field(1, "arp.opcode"), "2");
+
+# 2. ICMPv4 & ICMPv6
+cap.icmp_echo_request(0.010, "10.20.0.10", "1.1.1.1", 101, 1, 64, 48);
+cap.icmp_echo_reply(0.018, "1.1.1.1", "10.20.0.10", 101, 1, 58, 48);
+cap.icmp_time_exceeded(0.025, "172.16.0.1", "10.20.0.10", "1.1.1.1", 255);
+cap.icmp_dest_unreachable(0.030, "172.16.0.1", "10.20.0.10", "1.1.1.1", 3);
+cap.icmpv6_echo_request(0.040, "2001:db8:1::10", "2001:db8:1::1", 202, 5, 64, 32);
+cap.icmpv6_echo_reply(0.044, "2001:db8:1::1", "2001:db8:1::10", 202, 5, 64, 32);
+cap.icmpv6_neighbor_solicit(0.046, "2001:db8:1::10", "2001:db8:1::1");
+cap.icmpv6_neighbor_advert(0.047, "2001:db8:1::1", "2001:db8:1::10", "2001:db8:1::1");
+
+assert_eq(cap.protocol_packets("ICMP"), 4);
+assert_eq(cap.protocol_packets("ICMPv6"), 4);
+assert_eq(cap.pkt_field(2, "ip.checksum_ok"), "true");
+assert_eq(cap.pkt_field(2, "icmp.type"), "8");
+assert_eq(cap.pkt_field(3, "icmp.type"), "0");
+assert_eq(cap.pkt_field(4, "icmp.type"), "11");
+assert_eq(cap.pkt_field(5, "icmp.type"), "3");
+
+# 3. DNS (A, AAAA, TXT)
+cap.dns_query(0.050, "10.20.0.10", 51000, "8.8.8.8", 4096, "edge.lmctl.ai", "A");
+cap.dns_response(0.056, "8.8.8.8", "10.20.0.10", 51000, 4096, "edge.lmctl.ai", "A", "198.51.100.42", 0);
+cap.dns_query(0.060, "10.20.0.10", 51001, "8.8.8.8", 4097, "v6.lmctl.ai", "AAAA");
+cap.dns_response(0.066, "8.8.8.8", "10.20.0.10", 51001, 4097, "v6.lmctl.ai", "AAAA", "2001:db8:99::42", 0);
+cap.dns_query(0.070, "10.20.0.10", 51002, "8.8.8.8", 4098, "txt.lmctl.ai", "TXT");
+cap.dns_response(0.075, "8.8.8.8", "10.20.0.10", 51002, 4098, "txt.lmctl.ai", "TXT", "v=spf1 -all", 0);
+
+assert_eq(cap.pkt_field(11, "dns.qname"), "edge.lmctl.ai");
+assert_eq(cap.pkt_field(11, "dns.answer"), "198.51.100.42");
+assert_eq(cap.pkt_field(13, "dns.answer"), "2001:db8:99::42");
+assert_eq(cap.pkt_field(15, "dns.answer"), "v=spf1 -all");
+
+# 4. DHCP, NTP, QUIC
+cap.dhcp_message(0.080, "DISCOVER", "02:00:00:aa:bb:01", "0.0.0.0", "0.0.0.0", "0.0.0.0", 9001, "rack-host-07");
+cap.dhcp_message(0.082, "OFFER", "02:00:00:aa:bb:01", "0.0.0.0", "10.20.0.77", "10.20.0.1", 9001, "rack-host-07");
+cap.dhcp_message(0.084, "REQUEST", "02:00:00:aa:bb:01", "0.0.0.0", "10.20.0.77", "10.20.0.1", 9001, "rack-host-07");
+cap.dhcp_message(0.086, "ACK", "02:00:00:aa:bb:01", "0.0.0.0", "10.20.0.77", "10.20.0.1", 9001, "rack-host-07");
+
+assert_eq(cap.protocol_packets("DHCP"), 4);
+assert_eq(cap.pkt_field(19, "dhcp.type"), "ACK");
+assert_eq(cap.pkt_field(19, "dhcp.yiaddr"), "10.20.0.77");
+assert_eq(cap.pkt_field(19, "dhcp.hostname"), "rack-host-07");
+
+cap.ntp_packet(0.090, "10.20.0.10", 55123, "162.159.200.123", 3, 0, "INIT", 1700000100.0);
+cap.ntp_packet(0.094, "162.159.200.123", 123, "10.20.0.10", 4, 1, "ATOM", 1700000100.5);
+assert_eq(cap.protocol_packets("NTP"), 2);
+assert_eq(cap.pkt_field(21, "ntp.stratum"), "1");
+assert_eq(cap.pkt_field(21, "ntp.ref_id"), "ATOM");
+
+cap.quic_initial(0.100, "10.20.0.10", 58443, "198.51.100.42", 443, "v1", "1122334455667788", "99aabbcc", 1, 80);
+cap.quic_handshake(0.106, "198.51.100.42", 443, "10.20.0.10", 58443, "v2", "99aabbcc", "1122334455667788", 2, 96);
+cap.quic_short(0.112, "10.20.0.10", 58443, "198.51.100.42", 443, "1122334455667788", 3, 64);
+assert_eq(cap.protocol_packets("QUIC"), 3);
+assert_eq(cap.pkt_field(22, "quic.version"), "v1");
+assert_eq(cap.pkt_field(23, "quic.version"), "v2");
+assert_eq(cap.pkt_field(24, "quic.type"), "1-RTT");
+
+# 5. TCP + TLS 1.3 + HTTP/1.1
+cap.tcp_handshake(0.200, "10.20.0.10", 44100, "198.51.100.42", 443, 0.012);
+cap.tls_client_hello(0.215, "10.20.0.10", 44100, "198.51.100.42", 443, 1001, 5001, "edge.lmctl.ai", "1.3", "h2");
+cap.tls_server_hello(0.221, "198.51.100.42", 443, "10.20.0.10", 44100, 5001, 1100, "1.3", "h2", 4865);
+cap.tls_app_data(0.225, "10.20.0.10", 44100, "198.51.100.42", 443, 1100, 5090, 200);
+
+assert_eq(cap.pkt_field(28, "tls.sni"), "edge.lmctl.ai");
+assert_eq(cap.pkt_field(28, "tls.version"), "TLS 1.3");
+assert_eq(cap.pkt_field(28, "tls.alpn"), "h2");
+assert_eq(cap.pkt_field(28, "tcp.checksum_ok"), "true");
+
+cap.tcp_handshake(0.300, "10.20.0.10", 44200, "198.51.100.42", 8080, 0.010);
+cap.http_request(0.312, "10.20.0.10", 44200, "198.51.100.42", 8080, 1001, 5001, "POST", "/v1/telemetry", "edge.lmctl.ai", "{\"cpu\":0.72}");
+cap.http_response(0.320, "198.51.100.42", 8080, "10.20.0.10", 44200, 5001, 1110, 201, "Created", "application/json", "{\"accepted\":true}");
+
+assert_eq(cap.pkt_field(34, "http.method"), "POST");
+assert_eq(cap.pkt_field(34, "http.uri"), "/v1/telemetry");
+assert_eq(cap.pkt_field(34, "http.host"), "edge.lmctl.ai");
+assert_eq(cap.pkt_field(35, "http.status"), "201");
+end _dsl_
+savedsl(p, "build/tests/dissectors.dslb");
+r = system ${dsl_cli(p)} --dsl build/tests/dissectors.dslb;
+assert(r.code == 0);

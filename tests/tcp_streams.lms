@@ -1,0 +1,42 @@
+mkdir("build/tests");
+p = _dsl_ cli="lmshark" install="github:lmctl-ai/lmshark@latest";
+let cap = shark.capture();
+
+# Stream 0: HTTP API conversation with out-of-order segment and retransmission
+cap.tcp_handshake(0.000, "10.1.0.5", 41000, "10.1.0.80", 8080, 0.020);
+cap.tcp_segment(0.025, "10.1.0.5", 41000, "10.1.0.80", 8080, 1001, 5001, "PSH,ACK", 64240, "PART1-");
+# Out-of-order: PART3 arrives before PART2
+cap.tcp_segment(0.030, "10.1.0.5", 41000, "10.1.0.80", 8080, 1013, 5001, "PSH,ACK", 64240, "PART3");
+# Duplicate ACKs from server asking for 1007
+cap.tcp_segment(0.032, "10.1.0.80", 8080, "10.1.0.5", 41000, 5001, 1007, "ACK", 65535, "");
+cap.tcp_segment(0.034, "10.1.0.80", 8080, "10.1.0.5", 41000, 5001, 1007, "ACK", 65535, "");
+# Client sends missing PART2 (seq 1007..1013)
+cap.tcp_segment(0.038, "10.1.0.5", 41000, "10.1.0.80", 8080, 1007, 5001, "PSH,ACK", 64240, "PART2-");
+# Client retransmits PART3 (seq 1013..1018)
+cap.tcp_segment(0.042, "10.1.0.5", 41000, "10.1.0.80", 8080, 1013, 5001, "PSH,ACK", 64240, "PART3");
+# Server ACKs full stream (1018) and sends response payload
+cap.tcp_segment(0.050, "10.1.0.80", 8080, "10.1.0.5", 41000, 5001, 1018, "PSH,ACK", 65535, "RESP_OK");
+cap.tcp_close(0.060, "10.1.0.5", 41000, "10.1.0.80", 8080, 1018, 5008, 0.020);
+
+# Stream 1: Second independent TCP stream (40 ms RTT)
+cap.tcp_handshake(0.100, "10.1.0.6", 42000, "10.1.0.90", 9000, 0.040);
+cap.tcp_segment(0.150, "10.1.0.6", 42000, "10.1.0.90", 9000, 1001, 5001, "PSH,ACK", 64240, "PING");
+cap.tcp_segment(0.190, "10.1.0.90", 9000, "10.1.0.6", 42000, 5001, 1005, "PSH,ACK", 65535, "PONG");
+
+assert_eq(cap.tcp_stream_count(), 2);
+assert_eq(cap.retransmission_count(), 1);
+assert_eq(cap.out_of_order_count(), 1);
+assert_eq(cap.dup_ack_count(), 1);
+
+assert_eq(cap.tcp_stream_text(0, "client"), "PART1-PART2-PART3");
+assert_eq(cap.tcp_stream_text(0, "server"), "RESP_OK");
+assert_eq(cap.tcp_stream_bytes(0, "client"), 17);
+assert_eq(cap.tcp_stream_retransmissions(0), 1);
+
+assert_eq(cap.tcp_stream_text(1, "client"), "PING");
+assert_eq(cap.tcp_stream_text(1, "server"), "PONG");
+assert_close(cap.tcp_stream_rtt_ms(1), 30.0, 15.0);
+end _dsl_
+savedsl(p, "build/tests/tcp_streams.dslb");
+r = system ${dsl_cli(p)} --dsl build/tests/tcp_streams.dslb;
+assert(r.code == 0);

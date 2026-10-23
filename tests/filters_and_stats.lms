@@ -1,0 +1,47 @@
+mkdir("build/tests");
+p = _dsl_ cli="lmshark" install="github:lmctl-ai/lmshark@latest";
+let cap = shark.capture();
+
+cap.set_vlan(10);
+cap.dns_query(0.010, "10.0.10.5", 52000, "10.0.10.1", 100, "db.prod.local", "A");
+cap.dns_response(0.014, "10.0.10.1", "10.0.10.5", 52000, 100, "db.prod.local", "A", "10.0.20.99", 0);
+cap.clear_vlan();
+
+cap.set_vlan(20);
+cap.tcp_handshake(0.020, "10.0.10.5", 45000, "10.0.20.99", 443, 0.010);
+cap.tls_client_hello(0.035, "10.0.10.5", 45000, "10.0.20.99", 443, 1001, 5001, "db.prod.local", "1.3", "h2");
+cap.tls_server_hello(0.040, "10.0.20.99", 443, "10.0.10.5", 45000, 5001, 1090, "1.3", "h2", 4865);
+cap.clear_vlan();
+
+cap.http_request(0.050, "10.0.10.5", 46000, "10.0.30.80", 80, 1001, 5001, "GET", "/admin/config", "admin.local", "");
+cap.http_response(0.055, "10.0.30.80", 80, "10.0.10.5", 46000, 5001, 1060, 403, "Forbidden", "text/plain", "denied");
+
+# Display filter checks
+assert_eq(cap.filter("vlan.id == 10").packet_count(), 2);
+assert_eq(cap.filter("vlan.id == 20 && tls").packet_count(), 2);
+assert_eq(cap.filter("tls.sni contains \"prod\"").packet_count(), 1);
+assert_eq(cap.filter("http.status >= 400").packet_count(), 1);
+assert_eq(cap.filter("ip.addr == \"10.0.20.99\" && tcp.port == 443").packet_count(), 5);
+assert_eq(cap.filter("dns || http").packet_count(), 4);
+
+# BPF capture filter checks
+assert_eq(cap.bpf("vlan 10").packet_count(), 2);
+assert_eq(cap.bpf("tcp and port 443").packet_count(), 5);
+assert_eq(cap.bpf("net 10.0.20.0/24").packet_count(), 5);
+assert_eq(cap.bpf("tcp portrange 80-443").packet_count(), 7);
+
+# Export all CSVs and JSON
+cap.save_packets_csv("build/tests/test_packets.csv");
+cap.save_flows_csv("build/tests/test_flows.csv");
+cap.save_top_talkers_csv("build/tests/test_talkers.csv");
+cap.save_protocol_hierarchy_csv("build/tests/test_hierarchy.csv");
+cap.save_io_graph_csv(0.020, "build/tests/test_iograph.csv");
+cap.save_time_sequence_csv(0, "build/tests/test_timeseq.csv");
+cap.save_json("build/tests/test_report.json");
+
+assert_eq(cap.flow_count(), 3);
+assert_eq(cap.unique_hosts(), 4);
+end _dsl_
+savedsl(p, "build/tests/filters_and_stats.dslb");
+r = system ${dsl_cli(p)} --dsl build/tests/filters_and_stats.dslb;
+assert(r.code == 0);

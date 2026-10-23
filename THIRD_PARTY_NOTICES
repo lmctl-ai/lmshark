@@ -1,0 +1,25 @@
+Third-party notices for lmshark
+===============================
+
+lmshark's own code (cpp/, schema/, scripts/, examples/, tests/; including the vendored `cpp/dslvm.hpp`
+runtime from the cpp-dsl-sdk project and `cpp/memory_budget.{hpp,cpp}`) is Copyright (c) 2026 Lattice
+Systems LLC, MIT license (see LICENSE). `lmshark --notices` prints this file.
+
+There is no third-party packet-dissection or capture library in the binary: the pcap and pcapng readers
+and writers, packet builder, Internet checksums, protocol dissectors (Ethernet, IEEE 802.1Q VLAN, ARP,
+IPv4, IPv6, ICMP, ICMPv6, TCP, UDP, DNS, HTTP/1.x, TLS ClientHello/ServerHello SNI & supported_versions,
+DHCP, NTP, QUIC v1/v2), TCP stream reassembler, RTT and retransmission analyzer, conversation/flow tables,
+and display/BPF filter evaluators are original MIT implementations written from the public IETF RFCs and
+IEEE specifications.
+
+No code from Wireshark, libwireshark, tshark, tcpdump, or GPL/LGPL libraries is included or linked.
+
+Runtime libraries in static builds
+----------------------------------
+- Linux static builds link libstdc++/libgcc (GPL-3.0-with-GCC-exception, which permits static linking into
+  any MIT executable) and glibc (LGPL-2.1-or-later, which permits static linking provided the user can
+  relink against a modified glibc: the complete lmshark source and CMake build at
+  https://github.com/lmctl-ai/lmshark are public, so the binary can be rebuilt and relinked with any glibc;
+  glibc source at https://www.gnu.org/software/libc/).
+- Windows static builds link the MinGW-w64 runtime and winpthreads (Zope Public License / MIT / BSD / public
+  domain) and libstdc++/libgcc (GPL-3.0-with-GCC-exception).

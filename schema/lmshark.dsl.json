@@ -1,0 +1,827 @@
+{
+  "dsl.schema": 2,
+  "name": "lmshark",
+  "types": {
+    "Shark": {
+      "methods": {
+        "capture": [
+          {
+            "params": [],
+            "returns": "Capture"
+          }
+        ],
+        "open": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "Capture"
+          }
+        ]
+      }
+    },
+    "Capture": {
+      "methods": {
+        "set_macs": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "set_vlan": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "clear_vlan": [
+          {
+            "params": [],
+            "returns": "void"
+          }
+        ],
+        "arp_request": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "arp_reply": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "icmp_echo_request": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "int",
+              "int",
+              "int",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "icmp_echo_reply": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "int",
+              "int",
+              "int",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "icmp_time_exceeded": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "string",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "icmp_dest_unreachable": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "string",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "icmpv6_echo_request": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "int",
+              "int",
+              "int",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "icmpv6_echo_reply": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "int",
+              "int",
+              "int",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "icmpv6_neighbor_solicit": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "icmpv6_neighbor_advert": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "tcp_segment": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "int",
+              "string",
+              "int",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "tcp6_segment": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "int",
+              "string",
+              "int",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "tcp_handshake": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "float"
+            ],
+            "returns": "void"
+          }
+        ],
+        "tcp_close": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "int",
+              "float"
+            ],
+            "returns": "void"
+          }
+        ],
+        "udp_datagram": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "udp6_datagram": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "dns_query": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "dns_response": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "int",
+              "int",
+              "string",
+              "string",
+              "string",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "http_request": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "int",
+              "string",
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "http_response": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "int",
+              "int",
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "tls_client_hello": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "int",
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "tls_server_hello": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "int",
+              "string",
+              "string",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "tls_app_data": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "int",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "dhcp_message": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "int",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "ntp_packet": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "string",
+              "float"
+            ],
+            "returns": "void"
+          }
+        ],
+        "quic_initial": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "string",
+              "string",
+              "string",
+              "int",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "quic_handshake": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "string",
+              "string",
+              "string",
+              "int",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "quic_short": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "packet_count": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "total_bytes": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "duration": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "protocol_packets": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "int"
+          }
+        ],
+        "protocol_bytes": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "int"
+          }
+        ],
+        "tcp_stream_count": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "retransmission_count": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "out_of_order_count": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "dup_ack_count": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "avg_rtt_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "max_rtt_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "min_rtt_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "flow_count": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "unique_hosts": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "pkt_time": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "float"
+          }
+        ],
+        "pkt_len": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "int"
+          }
+        ],
+        "pkt_proto": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "string"
+          }
+        ],
+        "pkt_src": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "string"
+          }
+        ],
+        "pkt_dst": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "string"
+          }
+        ],
+        "pkt_srcport": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "int"
+          }
+        ],
+        "pkt_dstport": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "int"
+          }
+        ],
+        "pkt_vlan": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "int"
+          }
+        ],
+        "pkt_info": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "string"
+          }
+        ],
+        "pkt_field": [
+          {
+            "params": [
+              "int",
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "tcp_stream_text": [
+          {
+            "params": [
+              "int",
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "tcp_stream_bytes": [
+          {
+            "params": [
+              "int",
+              "string"
+            ],
+            "returns": "int"
+          }
+        ],
+        "tcp_stream_packets": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "int"
+          }
+        ],
+        "tcp_stream_retransmissions": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "int"
+          }
+        ],
+        "tcp_stream_rtt_ms": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "float"
+          }
+        ],
+        "filter": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "Capture"
+          }
+        ],
+        "bpf": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "Capture"
+          }
+        ],
+        "slice_time": [
+          {
+            "params": [
+              "float",
+              "float"
+            ],
+            "returns": "Capture"
+          }
+        ],
+        "merge": [
+          {
+            "params": [
+              "Capture"
+            ],
+            "returns": "Capture"
+          }
+        ],
+        "save_pcap": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "save_pcapng": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "save_packets_csv": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "save_flows_csv": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "save_top_talkers_csv": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "save_protocol_hierarchy_csv": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "save_io_graph_csv": [
+          {
+            "params": [
+              "float",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "save_time_sequence_csv": [
+          {
+            "params": [
+              "int",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "save_json": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "summary": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    }
+  },
+  "functions": {
+    "assert_eq": [
+      {
+        "params": [
+          "int",
+          "int"
+        ],
+        "returns": "void"
+      },
+      {
+        "params": [
+          "string",
+          "string"
+        ],
+        "returns": "void"
+      },
+      {
+        "params": [
+          "bool",
+          "bool"
+        ],
+        "returns": "void"
+      }
+    ],
+    "assert_close": [
+      {
+        "params": [
+          "float",
+          "float",
+          "float"
+        ],
+        "returns": "void"
+      }
+    ],
+    "print": [
+      {
+        "params": [
+          "string"
+        ],
+        "returns": "void"
+      }
+    ]
+  },
+  "context": {
+    "shark": "Shark"
+  }
+}

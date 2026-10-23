@@ -1,0 +1,117 @@
+mkdir("build/examples");
+mkdir("build/examples/io_frames");
+mkdir("images");
+mkdir("docs/images");
+
+# 1. Build a 6.0-second multi-protocol capture with traffic waves & retransmission spikes
+p = _dsl_ cli="lmshark" install="github:lmctl-ai/lmshark@latest";
+let cap = shark.capture();
+
+# Continuous DNS & HTTP baseline across [0.0, 6.0] seconds
+for (b in range(0, 60)) {
+    let t = float(b) * 0.10;
+    cap.dns_query(t, "10.0.1.10", 50000 + b, "1.1.1.1", 1000 + b, "svc.lmctl.ai", "A");
+    cap.dns_response(t + 0.008, "1.1.1.1", "10.0.1.10", 50000 + b, 1000 + b, "svc.lmctl.ai", "A", "10.0.2.20", 0);
+
+    # TLS 1.3 wave peaking around t = 1.8 s
+    let dt1 = (t - 1.8) / 0.75;
+    let tls_burst = int(1.0 + 10.0 * pow(2.718281828, -0.5 * dt1 * dt1));
+    for (k in range(0, tls_burst)) {
+        let tk = t + float(k) * 0.004;
+        let seq = 10000 + b * 20000 + k * 900;
+        cap.tls_app_data(tk, "10.0.2.20", 443, "10.0.1.10", 52443, seq, 5001, 860);
+    }
+
+    # QUIC v2 media wave peaking around t = 3.8 s
+    let dt2 = (t - 3.8) / 0.85;
+    let quic_burst = int(1.0 + 13.0 * pow(2.718281828, -0.5 * dt2 * dt2));
+    for (q in range(0, quic_burst)) {
+        let tq = t + 0.002 + float(q) * 0.004;
+        cap.quic_short(tq, "10.0.3.30", 443, "10.0.1.10", 56443, "0102030405060708", b * 20 + q, 980);
+    }
+
+    # Congestion & TCP retransmission spike around t = 4.2 .. 4.9 s
+    if (b >= 40 && b <= 50) {
+        let r_cnt = 6 - abs(b - 45);
+        for (r in range(0, r_cnt)) {
+            let rseq = 900000 + b * 1000;
+            cap.tcp_segment(t + 0.010 + float(r) * 0.003, "10.0.4.40", 8080, "10.0.1.10", 48080, rseq, 1001, "PSH,ACK", 32768, "BURST_PAYLOAD_SEGMENT_WITH_CONGESTION_RETRY_0123456789ABCDEF");
+            # Retransmit identical sequence range 5 ms later
+            cap.tcp_segment(t + 0.015 + float(r) * 0.003, "10.0.4.40", 8080, "10.0.1.10", 48080, rseq, 1001, "PSH,ACK", 32768, "BURST_PAYLOAD_SEGMENT_WITH_CONGESTION_RETRY_0123456789ABCDEF");
+        }
+    }
+}
+
+cap.save_io_graph_csv(0.10, "build/examples/io_graph.csv");
+assert_eq(cap.retransmission_count() > 25, true);
+end _dsl_
+savedsl(p, "build/examples/io_traffic_sweep.dslb");
+r = system ${dsl_cli(p)} --dsl build/examples/io_traffic_sweep.dslb;
+assert(r.code == 0);
+
+# 2. Render static dual-panel I/O Graph in lmplot
+plt = _dsl_ cli="lmplot" install="github:lmctl-ai/lmplot@latest";
+plot.png("images/io_traffic_burst.png", 900, 580);
+plot.cmd("set datafile separator ','");
+plot.cmd("set grid lw 1 lc rgb '#d0d7de'");
+plot.cmd("set multiplot layout 2,1 title 'Multi-Protocol I/O Throughput and Congestion Retransmission Analysis (lmshark)' font ',13'");
+
+plot.cmd("set size 1.0, 0.58");
+plot.cmd("set origin 0.0, 0.38");
+plot.cmd("set xlabel ''");
+plot.cmd("set ylabel 'Protocol Bytes / 100 ms'");
+plot.cmd("set xrange [0:6.0]");
+plot.cmd("set key top left box opaque");
+plot.cmd("plot 'build/examples/io_graph.csv' every ::1 using 1:11 with filledcurves y1=0 lc rgb '#2ea043' fs transparent solid 0.35 title 'QUIC v2 (UDP :443)', '' every ::1 using 1:11 with lines lw 2.2 lc rgb '#2ea043' notitle, '' every ::1 using 1:10 with filledcurves y1=0 lc rgb '#8957e5' fs transparent solid 0.35 title 'TLS 1.3 (TCP :443)', '' every ::1 using 1:10 with lines lw 2.2 lc rgb '#8957e5' notitle, '' every ::1 using 1:8 with lines lw 2.0 lc rgb '#d29922' title 'DNS Baseline'");
+
+plot.cmd("set size 1.0, 0.38");
+plot.cmd("set origin 0.0, 0.0");
+plot.cmd("set xlabel 'Capture Time (s)'");
+plot.cmd("set ylabel 'Total Mbps'");
+plot.cmd("set y2label 'Retransmissions / 100 ms'");
+plot.cmd("set ytics nomirror");
+plot.cmd("set y2tics 0, 2, 10");
+plot.cmd("set y2range [0:10]");
+plot.cmd("set xrange [0:6.0]");
+plot.cmd("set key top left box opaque");
+plot.cmd("plot 'build/examples/io_graph.csv' every ::1 using 1:4 axes x1y1 with lines lw 2.4 lc rgb '#0969da' title 'Aggregate Throughput (Mbps)', '' every ::1 using 1:12 axes x1y2 with boxes lc rgb '#cf222e' fs solid 0.65 title 'TCP Retransmission Spike'");
+plot.cmd("unset multiplot");
+plot.close();
+end _dsl_
+savedsl(plt, "build/examples/io_static_plot.dslb");
+rp = system ${dsl_cli(plt)} --dsl build/examples/io_static_plot.dslb;
+assert(rp.code == 0);
+copy_file("images/io_traffic_burst.png", "docs/images/io_traffic_burst.png");
+
+# 3. Render 24-frame animated I/O sweep GIF via lmplot + ffmpeg
+anim = _dsl_ cli="lmplot" install="github:lmctl-ai/lmplot@latest";
+for (f in range(0, 24)) {
+    let t_end = 0.60 + float(f) * (5.40 / 23.0);
+    plot.cmd("reset");
+    plot.png("build/examples/io_frames/frame_" + str(f) + ".png", 800, 480);
+    plot.cmd("set datafile separator ','");
+    plot.cmd("set grid lw 1 lc rgb '#d0d7de'");
+    plot.cmd("set title 'Live Packet Capture I/O Sweep: TLS 1.3 Wave -> QUIC v2 Burst -> TCP Congestion (t = " + str(float(int(t_end * 10.0)) / 10.0) + " s)' font ',12'");
+    plot.cmd("set xlabel 'Capture Time (s)'");
+    plot.cmd("set ylabel 'Bytes per 100 ms Bucket'");
+    plot.cmd("set y2label 'TCP Retransmissions'");
+    plot.cmd("set ytics nomirror");
+    plot.cmd("set y2tics 0, 2, 10");
+    plot.cmd("set xrange [0:6.0]");
+    plot.cmd("set yrange [0:16000]");
+    plot.cmd("set y2range [0:10]");
+    plot.cmd("set key top left box opaque");
+    plot.cmd("set arrow 1 from " + str(t_end) + ",0 to " + str(t_end) + ",16000 nohead lw 2 dt 2 lc rgb '#cf222e'");
+    plot.cmd("plot 'build/examples/io_graph.csv' every ::1 using ($1 <= " + str(t_end) + " ? $1 : 1/0):11 axes x1y1 with filledcurves y1=0 lc rgb '#2ea043' fs transparent solid 0.35 title 'QUIC v2 Bytes', '' every ::1 using ($1 <= " + str(t_end) + " ? $1 : 1/0):10 axes x1y1 with filledcurves y1=0 lc rgb '#8957e5' fs transparent solid 0.35 title 'TLS 1.3 Bytes', '' every ::1 using ($1 <= " + str(t_end) + " ? $1 : 1/0):5 axes x1y1 with lines lw 2.2 lc rgb '#0969da' title 'Total TCP Bytes', '' every ::1 using ($1 <= " + str(t_end) + " ? $1 : 1/0):12 axes x1y2 with impulses lw 5 lc rgb '#cf222e' title 'Retransmissions'");
+    plot.close();
+}
+end _dsl_
+savedsl(anim, "build/examples/io_anim_plot.dslb");
+ra = system ${dsl_cli(anim)} --dsl build/examples/io_anim_plot.dslb;
+assert(ra.code == 0);
+
+if (which("ffmpeg") != null) {
+    g = system ffmpeg -y -loglevel error -framerate 10 -i build/examples/io_frames/frame_%d.png -vf "split[s0][s1];[s0]palettegen=max_colors=96[p];[s1][p]paletteuse=dither=bayer" -loop 0 images/io_traffic_sweep.gif;
+    assert(g.code == 0);
+    copy_file("images/io_traffic_sweep.gif", "docs/images/io_traffic_sweep.gif");
+}
