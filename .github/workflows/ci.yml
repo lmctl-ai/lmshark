@@ -144,12 +144,15 @@ jobs:
           got="$(dist/lmshark-linux-x64 --version)"
           test "$got" = "lmshark ${GITHUB_REF_NAME#v}" || { echo "::error::tag $GITHUB_REF_NAME but binary says '$got' (bump project VERSION in CMakeLists.txt)"; exit 1; }
 
+      - name: generate binary checksums
+        run: (cd dist && sha256sum lmshark-*) > dist/SHA256SUMS
+
       - name: attach binaries to the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --clobber dist/*
+            gh release upload "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --clobber dist/* dist/SHA256SUMS
           else
-            gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes dist/*
+            gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes dist/* dist/SHA256SUMS
           fi
