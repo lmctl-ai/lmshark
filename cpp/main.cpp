@@ -123,6 +123,10 @@ void register_host(dslvm::Registry& r, Host& h) {
         C(p).set_vlan(a[0].i);
         return Value::none();
     });
+    check(r, "Capture", "set_qinq", {"int", "int"}, "void", [](void* p, Args& a) {
+        C(p).set_qinq(a[0].i, a[1].i);
+        return Value::none();
+    });
     check(r, "Capture", "clear_vlan", {}, "void", [](void* p, Args&) {
         C(p).clear_vlan();
         return Value::none();
@@ -206,6 +210,15 @@ void register_host(dslvm::Registry& r, Host& h) {
           [](void* p, Args& a) {
               finite(a[0].f, "Capture.icmpv6_neighbor_advert");
               C(p).icmpv6_neighbor_advert(a[0].f, a[1].s, a[2].s, a[3].s);
+              return Value::none();
+          });
+    check(r, "Capture", "tcp_segment_opts",
+          {"float", "string", "int", "string", "int", "int", "int", "string", "int", "string",
+           "string"},
+          "void", [](void* p, Args& a) {
+              finite(a[0].f, "Capture.tcp_segment_opts");
+              C(p).tcp_segment_opts(a[0].f, a[1].s, a[2].i, a[3].s, a[4].i, a[5].i, a[6].i,
+                                    a[7].s, a[8].i, a[9].s, a[10].s);
               return Value::none();
           });
     check(r, "Capture", "tcp_segment",
@@ -443,6 +456,19 @@ void register_host(dslvm::Registry& r, Host& h) {
     });
 
     // Filtering, slicing, merging
+    check(r, "Capture", "count", {"string"}, "int", [](void* p, Args& a) {
+        return Value::integer(C(p).count(a[0].s));
+    });
+    check(r, "Capture", "save_fields_csv", {"string", "string", "string"}, "void",
+          [](void* p, Args& a) {
+              C(p).save_fields_csv(a[0].s, a[1].s, a[2].s);
+              return Value::none();
+          });
+    check(r, "Capture", "save_field_counts_csv", {"string", "string", "string"}, "void",
+          [](void* p, Args& a) {
+              C(p).save_field_counts_csv(a[0].s, a[1].s, a[2].s);
+              return Value::none();
+          });
     check(r, "Capture", "filter", {"string"}, "Capture", [&h](void* p, Args& a) {
         return h.hold_capture(C(p).filter(a[0].s));
     });

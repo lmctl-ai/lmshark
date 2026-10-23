@@ -6,7 +6,7 @@ runtime from the cpp-dsl-sdk project and `cpp/memory_budget.{hpp,cpp}`) is Copyr
 Systems LLC, MIT license (see LICENSE). `lmshark --notices` prints this file.
 
 There is no third-party packet-dissection or capture library in the binary: the pcap and pcapng readers
-and writers, packet builder, Internet checksums, protocol dissectors (Ethernet, IEEE 802.1Q VLAN, ARP,
+and writers, packet builder, Internet checksums, protocol dissectors (Ethernet, Linux SLL, BSD loopback, IEEE 802.1Q VLAN and 802.1ad QinQ, ARP,
 IPv4, IPv6, ICMP, ICMPv6, TCP, UDP, DNS, HTTP/1.x, TLS ClientHello/ServerHello SNI & supported_versions,
 DHCP, NTP, QUIC v1/v2), TCP stream reassembler, RTT and retransmission analyzer, conversation/flow tables,
 and display/BPF filter evaluators are original MIT implementations written from the public IETF RFCs and

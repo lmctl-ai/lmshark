@@ -10,9 +10,11 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <regex>
 #include <tuple>
 
 namespace lmshark {
@@ -382,20 +384,26 @@ bool verify_ipv6_l4_checksum(const std::vector<uint8_t>& src_ip6, const std::vec
 }
 
 void append_eth_header(std::vector<uint8_t>& pkt, const std::string& src_mac,
-                       const std::string& dst_mac, uint16_t vlan_id, uint16_t ethertype) {
+                       const std::string& dst_mac, uint32_t vlan_id, uint16_t ethertype) {
     auto dst = parse_mac(dst_mac);
     auto src = parse_mac(src_mac);
     pkt.insert(pkt.end(), dst.begin(), dst.end());
     pkt.insert(pkt.end(), src.begin(), src.end());
-    if (vlan_id > 0) {
+    uint16_t outer = static_cast<uint16_t>((vlan_id >> 16) & 0x0FFF);
+    uint16_t inner = static_cast<uint16_t>(vlan_id & 0x0FFF);
+    if (outer > 0) {
+        push_u16_be(pkt, 0x88A8); // IEEE 802.1ad service tag (QinQ outer)
+        push_u16_be(pkt, outer);
+    }
+    if (inner > 0) {
         push_u16_be(pkt, 0x8100);
-        push_u16_be(pkt, static_cast<uint16_t>(vlan_id & 0x0FFF));
+        push_u16_be(pkt, inner);
     }
     push_u16_be(pkt, ethertype);
 }
 
 void append_ipv4_packet(std::vector<uint8_t>& frame, const std::string& src_mac,
-                        const std::string& dst_mac, uint16_t vlan_id, const std::string& src_ip_str,
+                        const std::string& dst_mac, uint32_t vlan_id, const std::string& src_ip_str,
                         const std::string& dst_ip_str, uint8_t proto, uint8_t ttl,
                         const std::vector<uint8_t>& l4_payload, uint16_t ip_id = 0x1234,
                         uint16_t frag_field = 0x4000) {
@@ -426,7 +434,7 @@ void append_ipv4_packet(std::vector<uint8_t>& frame, const std::string& src_mac,
 }
 
 void append_ipv6_packet(std::vector<uint8_t>& frame, const std::string& src_mac,
-                        const std::string& dst_mac, uint16_t vlan_id,
+                        const std::string& dst_mac, uint32_t vlan_id,
                         const std::string& src_ip6_str, const std::string& dst_ip6_str,
                         uint8_t next_hdr, uint8_t hop_limit,
                         const std::vector<uint8_t>& l4_payload) {
@@ -455,6 +463,40 @@ uint16_t parse_tcp_flags(const std::string& flags_str) {
     if (u.find("CWR") != std::string::npos) f |= 0x80;
     if (u.find("NS") != std::string::npos) f |= 0x100;
     return f;
+}
+
+bool supported_linktype(int64_t lt) { return lt == 0 || lt == 1 || lt == 101 || lt == 113; }
+
+int64_t seconds_to_ns(double ts) {
+    if (!std::isfinite(ts) || std::fabs(ts) > 9.0e9) {
+        throw std::runtime_error("Packet timestamp out of range (|ts| must be < 9e9 s)");
+    }
+    double whole = std::floor(ts);
+    int64_t ns = static_cast<int64_t>(whole) * 1000000000LL +
+                 static_cast<int64_t>(std::llround((ts - whole) * 1e9));
+    return ns;
+}
+
+// Convert a pcapng EPB timestamp in interface units to integer nanoseconds without going
+// through floating point. code is the raw if_tsresol byte: bit7 clear = 10^-n, set = 2^-n.
+__extension__ typedef unsigned __int128 u128_t;
+
+int64_t pcapng_units_to_ns(uint64_t units, int code) {
+    int e = code & 0x7F;
+    u128_t v = units;
+    if ((code & 0x80) == 0) {
+        if (e <= 9) {
+            for (int i = e; i < 9; ++i) v *= 10u;
+        } else {
+            for (int i = 9; i < e; ++i) v /= 10u;
+        }
+    } else {
+        v = (v * 1000000000u) >> e;
+    }
+    if (v > static_cast<u128_t>(INT64_MAX)) {
+        throw std::runtime_error("pcapng timestamp overflows 64-bit nanoseconds");
+    }
+    return static_cast<int64_t>(v);
 }
 
 std::string format_tcp_flags(uint16_t flags) {
@@ -626,8 +668,12 @@ void dissect_dns(DissectedPacket& p, const uint8_t* data, size_t len) {
                 ans.assign(reinterpret_cast<const char*>(data + off + 1), txt_len);
             }
         }
-        if (!ans.empty() && p.dns_answer.empty()) {
-            p.dns_answer = ans;
+        if (!ans.empty()) {
+            if (p.dns_answer.empty()) p.dns_answer = ans;
+            if (p.dns_answers.size() < 64) {
+                p.dns_answers.push_back(ans);
+                p.dns_answer_types.push_back(dns_qtype_name(atype));
+            }
         }
         off += rdlen;
     }
@@ -643,8 +689,11 @@ void dissect_dns(DissectedPacket& p, const uint8_t* data, size_t len) {
             inf << " NXDOMAIN";
         } else if (p.dns_rcode != 0) {
             inf << " RCODE=" << static_cast<int>(p.dns_rcode);
-        } else if (!p.dns_answer.empty()) {
-            inf << " -> " << p.dns_answer;
+        } else if (!p.dns_answers.empty()) {
+            inf << " ->";
+            for (size_t k = 0; k < p.dns_answers.size(); ++k) {
+                inf << " " << p.dns_answer_types[k] << " " << p.dns_answers[k];
+            }
         }
     }
     p.info = inf.str();
@@ -1078,6 +1127,39 @@ void dissect_l4_and_above(DissectedPacket& p, uint8_t l4_proto, const uint8_t* l
         inf << p.tcp_srcport << " -> " << p.tcp_dstport << " [" << format_tcp_flags(p.tcp_flags)
             << "] Seq=" << p.tcp_seq << " Ack=" << p.tcp_ack << " Win=" << p.tcp_window
             << " Len=" << p.tcp_payload_len;
+        // TCP options (kind/length TLVs between byte 20 and the data offset)
+        for (size_t o = 20; o < doff;) {
+            uint8_t kind = l4_buf[o];
+            if (kind == 0) break;         // End of option list
+            if (kind == 1) { ++o; continue; } // NOP
+            if (o + 1 >= doff) break;
+            uint8_t olen = l4_buf[o + 1];
+            if (olen < 2 || o + olen > doff) break; // malformed: stop, keep what we have
+            const uint8_t* v = l4_buf + o + 2;
+            if (kind == 2 && olen == 4) {
+                p.tcp_opt_mss = read_u16_be(v);
+            } else if (kind == 3 && olen == 3) {
+                p.tcp_opt_wscale = std::min<int>(v[0], 14); // RFC 7323: shifts above 14 use 14
+            } else if (kind == 4 && olen == 2) {
+                p.tcp_opt_sack_perm = true;
+            } else if (kind == 5 && olen >= 10 && (olen - 2) % 8 == 0) {
+                for (size_t b = 0; b + 8 <= static_cast<size_t>(olen - 2); b += 8) {
+                    if (!p.tcp_opt_sack.empty()) p.tcp_opt_sack += ";";
+                    p.tcp_opt_sack += std::to_string(read_u32_be(v + b)) + "-" +
+                                      std::to_string(read_u32_be(v + b + 4));
+                }
+            } else if (kind == 8 && olen == 10) {
+                p.tcp_opt_has_ts = true;
+                p.tcp_opt_tsval = read_u32_be(v);
+                p.tcp_opt_tsecr = read_u32_be(v + 4);
+            }
+            o += olen;
+        }
+        if (p.tcp_opt_mss >= 0) inf << " MSS=" << p.tcp_opt_mss;
+        if (p.tcp_opt_wscale >= 0) inf << " WS=" << (1 << p.tcp_opt_wscale);
+        if (p.tcp_opt_sack_perm) inf << " SACK_PERM";
+        if (!p.tcp_opt_sack.empty()) inf << " SACK=" << p.tcp_opt_sack;
+        if (p.tcp_opt_has_ts) inf << " TSval=" << p.tcp_opt_tsval << " TSecr=" << p.tcp_opt_tsecr;
         p.info = inf.str();
 
         if (p.tcp_payload_len > 0) {
@@ -1283,6 +1365,27 @@ DissectedPacket dissect_raw_frame(uint32_t number, double ts, const std::vector<
     p.protocol = "RAW";
     p.info = "Raw frame (" + std::to_string(p.wire_len) + " bytes)";
 
+    if (linktype == 113) {
+        // LINKTYPE_LINUX_SLL ("tcpdump -i any"): 16-byte cooked header, protocol at 14..15
+        if (raw.size() >= 16) {
+            uint16_t proto = read_u16_be(raw.data() + 14);
+            p.eth_type = proto;
+            dissect_l3_and_above(p, proto, 16);
+        }
+        return p;
+    }
+    if (linktype == 0) {
+        // LINKTYPE_NULL (BSD loopback): 4-byte address family in the writer's byte order
+        if (raw.size() >= 4) {
+            uint32_t af_le = static_cast<uint32_t>(raw[0]) | (static_cast<uint32_t>(raw[1]) << 8) |
+                             (static_cast<uint32_t>(raw[2]) << 16) |
+                             (static_cast<uint32_t>(raw[3]) << 24);
+            uint32_t af = (af_le > 0xFFFF) ? read_u32_be(raw.data()) : af_le;
+            if (af == 2) dissect_l3_and_above(p, 0x0800, 4);
+            else if (af == 24 || af == 28 || af == 30) dissect_l3_and_above(p, 0x86DD, 4);
+        }
+        return p;
+    }
     if (linktype == 101) {
         // LINKTYPE_RAW (raw IPv4 or IPv6)
         if (!raw.empty()) {
@@ -1307,11 +1410,15 @@ DissectedPacket dissect_raw_frame(uint32_t number, double ts, const std::vector<
     uint16_t etype = read_u16_be(raw.data() + 12);
     size_t offset = 14;
 
-    while ((etype == 0x8100 || etype == 0x88A8) && offset + 4 <= raw.size()) {
-        p.has_vlan = true;
+    while ((etype == 0x8100 || etype == 0x88A8 || etype == 0x9100) && offset + 4 <= raw.size() &&
+           p.vlan_ids.size() < 8) {
         uint16_t tci = read_u16_be(raw.data() + offset);
-        p.vlan_prio = static_cast<uint8_t>((tci >> 13) & 0x07);
-        p.vlan_id = static_cast<uint16_t>(tci & 0x0FFF);
+        if (!p.has_vlan) {
+            p.vlan_prio = static_cast<uint8_t>((tci >> 13) & 0x07);
+            p.vlan_id = static_cast<uint16_t>(tci & 0x0FFF);
+        }
+        p.has_vlan = true;
+        p.vlan_ids.push_back(static_cast<uint16_t>(tci & 0x0FFF));
         etype = read_u16_be(raw.data() + offset + 2);
         offset += 4;
     }
@@ -1338,7 +1445,15 @@ void Capture::set_vlan(int64_t vlan_id) {
     if (vlan_id < 0 || vlan_id > 4094) {
         throw std::runtime_error("VLAN ID must be in 0..4094");
     }
-    default_vlan_id_ = static_cast<uint16_t>(vlan_id);
+    default_vlan_id_ = static_cast<uint32_t>(vlan_id);
+}
+
+void Capture::set_qinq(int64_t outer_vlan_id, int64_t inner_vlan_id) {
+    if (outer_vlan_id < 1 || outer_vlan_id > 4094 || inner_vlan_id < 1 || inner_vlan_id > 4094) {
+        throw std::runtime_error("QinQ VLAN IDs must be in 1..4094");
+    }
+    default_vlan_id_ = (static_cast<uint32_t>(outer_vlan_id) << 16) |
+                       static_cast<uint32_t>(inner_vlan_id);
 }
 
 void Capture::clear_vlan() { default_vlan_id_ = 0; }
@@ -1348,14 +1463,17 @@ void Capture::add_raw_packet(double ts, const std::vector<uint8_t>& raw, uint32_
     membudget::require(sizeof(DissectedPacket) + raw.size() + 128);
     uint32_t num = static_cast<uint32_t>(packets_.size() + 1);
     packets_.push_back(dissect_raw_frame(num, ts, raw, wire_len, linktype));
-    if (!defer_analyze && (packets_.back().has_tcp || packets_.back().ip_fragmented)) {
-        analyze();
+    packets_.back().ts_ns = ts_ns_override_set_ ? ts_ns_override_ : seconds_to_ns(ts);
+    ts_ns_override_set_ = false;
+    if (!defer_analyze && (packets_.back().has_tcp || packets_.back().ip_fragmented ||
+                           packets_.back().has_dns)) {
+        dirty_ = true;
     }
 }
 
 void Capture::raw_frame(double ts, const std::string& hex_bytes, int64_t linktype) {
-    if (linktype != 1 && linktype != 101) {
-        throw std::runtime_error("Unsupported linktype (expected 1=Ethernet or 101=Raw IP): " +
+    if (!supported_linktype(linktype)) {
+        throw std::runtime_error("Unsupported linktype (expected 0=Null, 1=Ethernet, 101=Raw IP or 113=Linux SLL): " +
                                  std::to_string(linktype));
     }
     auto bytes = parse_hex_bytes(hex_bytes);
@@ -1443,7 +1561,7 @@ void Capture::arp_reply(double ts, const std::string& sender_mac, const std::str
 }
 
 static void emit_icmp_echo(Capture& cap, const std::string& smac, const std::string& dmac,
-                           uint16_t vlan, double ts, const std::string& src_ip,
+                           uint32_t vlan, double ts, const std::string& src_ip,
                            const std::string& dst_ip, uint8_t icmp_type, int64_t id, int64_t seq,
                            int64_t ttl, int64_t payload_len) {
     if (payload_len < 0) payload_len = 0;
@@ -1539,7 +1657,7 @@ void Capture::icmp_dest_unreachable(double ts, const std::string& router_ip,
 }
 
 static void emit_icmpv6_echo(Capture& cap, const std::string& smac, const std::string& dmac,
-                             uint16_t vlan, double ts, const std::string& src_ip6,
+                             uint32_t vlan, double ts, const std::string& src_ip6,
                              const std::string& dst_ip6, uint8_t type, int64_t id, int64_t seq,
                              int64_t hop_limit, int64_t payload_len) {
     if (payload_len < 0) payload_len = 0;
@@ -1623,18 +1741,21 @@ void Capture::icmpv6_neighbor_advert(double ts, const std::string& src_ip6,
 static std::vector<uint8_t> build_tcp_segment_bytes(uint16_t src_port, uint16_t dst_port,
                                                     uint32_t seq, uint32_t ack, uint16_t flags,
                                                     uint16_t window,
-                                                    const uint8_t* payload, size_t payload_len) {
+                                                    const uint8_t* payload, size_t payload_len,
+                                                    const std::vector<uint8_t>& options = {}) {
     std::vector<uint8_t> tcp;
-    tcp.reserve(20 + payload_len);
+    tcp.reserve(20 + options.size() + payload_len);
     push_u16_be(tcp, src_port);
     push_u16_be(tcp, dst_port);
     push_u32_be(tcp, seq);
     push_u32_be(tcp, ack);
-    tcp.push_back((flags & 0x100) ? 0x51 : 0x50); // Data offset 5 (20 bytes) + NS bit
+    uint8_t doff_words = static_cast<uint8_t>(5 + options.size() / 4);
+    tcp.push_back(static_cast<uint8_t>((doff_words << 4) | ((flags & 0x100) ? 0x01 : 0x00)));
     tcp.push_back(static_cast<uint8_t>(flags & 0xFF));
     push_u16_be(tcp, window);
     push_u16_be(tcp, 0); // Checksum placeholder
     push_u16_be(tcp, 0); // Urgent pointer
+    tcp.insert(tcp.end(), options.begin(), options.end());
     if (payload_len > 0) {
         tcp.insert(tcp.end(), payload, payload + payload_len);
     }
@@ -1656,6 +1777,110 @@ void Capture::tcp_segment(double ts, const std::string& src_ip, int64_t src_port
     tcp[16] = static_cast<uint8_t>((csum >> 8) & 0xFF);
     tcp[17] = static_cast<uint8_t>(csum & 0xFF);
 
+    std::vector<uint8_t> frame;
+    append_ipv4_packet(frame, default_src_mac_, default_dst_mac_, default_vlan_id_, src_ip, dst_ip,
+                       6, 64, tcp);
+    add_raw_packet(ts, frame);
+}
+
+// Encode an options spec such as "mss=1460,sack_perm,ts=100/0,nop,wscale=7" or
+// "sack=1001-2001;3001-4001" into wire TLVs padded to a 4-byte boundary (max 40 bytes).
+static std::vector<uint8_t> encode_tcp_options(const std::string& spec) {
+    std::vector<uint8_t> out;
+    auto num = [](const std::string& t, uint64_t maxv, const char* what) -> uint64_t {
+        if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) {
+            throw std::runtime_error(std::string("Invalid TCP option ") + what + " value: '" + t + "'");
+        }
+        unsigned long long v = std::strtoull(t.c_str(), nullptr, 10);
+        if (t.size() > 20 || v > maxv) {
+            throw std::runtime_error(std::string("TCP option ") + what + " out of range: " + t);
+        }
+        return v;
+    };
+    std::stringstream ss(spec);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item = trim(item);
+        if (item.empty()) continue;
+        std::string key = to_lower(item.substr(0, item.find('=')));
+        std::string val = item.find('=') == std::string::npos ? "" : trim(item.substr(item.find('=') + 1));
+        if (key == "nop") {
+            out.push_back(1);
+        } else if (key == "mss") {
+            out.push_back(2); out.push_back(4);
+            push_u16_be(out, static_cast<uint16_t>(num(val, 65535, "mss")));
+        } else if (key == "wscale" || key == "ws") {
+            out.push_back(3); out.push_back(3);
+            out.push_back(static_cast<uint8_t>(num(val, 14, "wscale")));
+        } else if (key == "sack_perm" || key == "sackok") {
+            out.push_back(4); out.push_back(2);
+        } else if (key == "sack") {
+            std::vector<std::pair<uint32_t, uint32_t>> blocks;
+            std::stringstream bs(val);
+            std::string blk;
+            while (std::getline(bs, blk, ';')) {
+                size_t dash = blk.find('-');
+                if (dash == std::string::npos) {
+                    throw std::runtime_error("TCP SACK block must be LEFT-RIGHT: '" + blk + "'");
+                }
+                blocks.push_back({static_cast<uint32_t>(num(trim(blk.substr(0, dash)), 0xFFFFFFFFull, "sack")),
+                                  static_cast<uint32_t>(num(trim(blk.substr(dash + 1)), 0xFFFFFFFFull, "sack"))});
+            }
+            if (blocks.empty() || blocks.size() > 4) {
+                throw std::runtime_error("TCP SACK option needs 1..4 blocks");
+            }
+            out.push_back(5);
+            out.push_back(static_cast<uint8_t>(2 + 8 * blocks.size()));
+            for (auto& b : blocks) { push_u32_be(out, b.first); push_u32_be(out, b.second); }
+        } else if (key == "ts") {
+            size_t slash = val.find('/');
+            if (slash == std::string::npos) {
+                throw std::runtime_error("TCP timestamp option must be ts=TSVAL/TSECR");
+            }
+            out.push_back(8); out.push_back(10);
+            push_u32_be(out, static_cast<uint32_t>(num(trim(val.substr(0, slash)), 0xFFFFFFFFull, "tsval")));
+            push_u32_be(out, static_cast<uint32_t>(num(trim(val.substr(slash + 1)), 0xFFFFFFFFull, "tsecr")));
+        } else {
+            throw std::runtime_error("Unknown TCP option '" + key +
+                                     "' (expected mss, wscale, sack_perm, sack, ts, nop)");
+        }
+    }
+    while (out.size() % 4 != 0) out.push_back(0); // End-of-options padding
+    if (out.size() > 40) {
+        throw std::runtime_error("TCP options exceed 40 bytes (" + std::to_string(out.size()) + ")");
+    }
+    return out;
+}
+
+static void check_tcp_args(int64_t src_port, int64_t dst_port, int64_t seq, int64_t ack,
+                           int64_t window) {
+    if (src_port < 0 || src_port > 65535 || dst_port < 0 || dst_port > 65535) {
+        throw std::runtime_error("TCP port out of range 0..65535");
+    }
+    if (seq < 0 || seq > 0xFFFFFFFFLL || ack < 0 || ack > 0xFFFFFFFFLL) {
+        throw std::runtime_error("TCP seq/ack out of range 0..4294967295");
+    }
+    if (window < 0 || window > 65535) {
+        throw std::runtime_error("TCP window out of range 0..65535");
+    }
+}
+
+void Capture::tcp_segment_opts(double ts, const std::string& src_ip, int64_t src_port,
+                               const std::string& dst_ip, int64_t dst_port, int64_t seq,
+                               int64_t ack, const std::string& flags, int64_t window,
+                               const std::string& options, const std::string& payload) {
+    check_tcp_args(src_port, dst_port, seq, ack, window);
+    uint16_t f = parse_tcp_flags(flags);
+    auto opts = encode_tcp_options(options);
+    auto tcp = build_tcp_segment_bytes(
+        static_cast<uint16_t>(src_port), static_cast<uint16_t>(dst_port),
+        static_cast<uint32_t>(seq), static_cast<uint32_t>(ack), f, static_cast<uint16_t>(window),
+        reinterpret_cast<const uint8_t*>(payload.data()), payload.size(), opts);
+    auto sip = parse_ipv4(src_ip);
+    auto dip = parse_ipv4(dst_ip);
+    uint16_t csum = ipv4_l4_checksum(sip, dip, 6, tcp.data(), tcp.size());
+    tcp[16] = static_cast<uint8_t>((csum >> 8) & 0xFF);
+    tcp[17] = static_cast<uint8_t>(csum & 0xFF);
     std::vector<uint8_t> frame;
     append_ipv4_packet(frame, default_src_mac_, default_dst_mac_, default_vlan_id_, src_ip, dst_ip,
                        6, 64, tcp);
@@ -1706,7 +1931,7 @@ void Capture::tcp_close(double ts, const std::string& client_ip, int64_t client_
 }
 
 static void emit_udp_ipv4(Capture& cap, const std::string& smac, const std::string& dmac,
-                          uint16_t vlan, double ts, const std::string& src_ip, uint16_t src_port,
+                          uint32_t vlan, double ts, const std::string& src_ip, uint16_t src_port,
                           const std::string& dst_ip, uint16_t dst_port,
                           const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> udp;
@@ -2069,7 +2294,7 @@ void Capture::ntp_packet(double ts, const std::string& src_ip, int64_t src_port,
 }
 
 static void emit_quic_long(Capture& cap, const std::string& smac, const std::string& dmac,
-                           uint16_t vlan, double ts, const std::string& src_ip, int64_t src_port,
+                           uint32_t vlan, double ts, const std::string& src_ip, int64_t src_port,
                            const std::string& dst_ip, int64_t dst_port, const std::string& version,
                            bool is_handshake, const std::string& dcid_hex,
                            const std::string& scid_hex, int64_t pkt_num, int64_t payload_len) {
@@ -2179,6 +2404,12 @@ struct TcpDirState {
     uint32_t last_win_seen = 0;
     int dup_ack_streak = 0;
     size_t first_unacked_idx = 0;
+    bool syn_anywhere = false;     // pre-pass: a SYN exists in this direction
+    bool has_min_hint = false;     // pre-pass: earliest sequence seen (midstream captures)
+    uint32_t min_seq_hint = 0;
+    int wscale = -1;               // window-scale shift announced on this side's SYN
+    bool has_acked = false;        // highest ACK the peer sent for this direction
+    uint64_t acked_upto = 0;
     std::vector<std::pair<uint64_t, uint64_t>> sent_ranges;
     std::vector<SentSegRecord> unacked;
 };
@@ -2227,8 +2458,10 @@ void Capture::analyze() {
     for (size_t i = 0; i < packets_.size(); ++i) {
         auto& p = packets_[i];
         if (p.ip_reassembled) {
+            int64_t keep_ns = p.ts_ns;
             p = dissect_raw_frame(static_cast<uint32_t>(i + 1), p.timestamp, p.raw, p.wire_len,
                                   p.linktype);
+            p.ts_ns = keep_ns;
         }
         p.number = static_cast<uint32_t>(i + 1);
         if (!p.ip_fragmented) continue;
@@ -2323,6 +2556,24 @@ void Capture::analyze() {
         }
     }
 
+    // 2b. Midstream captures: without a SYN, anchor each direction at its earliest sequence
+    // number (serial-number arithmetic, RFC 1982) so a segment captured out of order before
+    // the first-seen one does not land 4 GiB away in relative space.
+    for (const auto& p : packets_) {
+        if (!p.has_tcp) continue;
+        TcpStreamState& st =
+            streams[make_canonical_tcp_key(p.ip_src, p.tcp_srcport, p.ip_dst, p.tcp_dstport)];
+        bool fi = (p.ip_src == st.init_ip && p.tcp_srcport == st.init_port);
+        TcpDirState& ds = st.dir[fi ? 0 : 1];
+        if (p.flag_syn()) ds.syn_anywhere = true;
+        if (!ds.has_min_hint) {
+            ds.has_min_hint = true;
+            ds.min_seq_hint = p.tcp_seq;
+        } else if (static_cast<int32_t>(p.tcp_seq - ds.min_seq_hint) < 0) {
+            ds.min_seq_hint = p.tcp_seq;
+        }
+    }
+
     // 3. Main TCP sequence/ack/retransmission/OOO/RTT pass in 64-bit relative sequence space
     for (size_t i = 0; i < packets_.size(); ++i) {
         auto& p = packets_[i];
@@ -2333,6 +2584,13 @@ void Capture::analyze() {
         p.tcp_dup_ack = false;
         p.tcp_rtt_ms = 0.0;
         p.tcp_saw_syn = false;
+        p.tcp_fast_retransmission = false;
+        p.tcp_bytes_in_flight = -1;
+        p.tcp_win_scaled = -1;
+        // Drop analysis prefixes from an earlier analyze() run; they are recomputed below.
+        while (p.info.compare(0, 5, "[TCP ") == 0 && p.info.find("] ") != std::string::npos) {
+            p.info.erase(0, p.info.find("] ") + 2);
+        }
         if (!p.has_tcp) continue;
 
         auto key = make_canonical_tcp_key(p.ip_src, p.tcp_srcport, p.ip_dst, p.tcp_dstport);
@@ -2348,7 +2606,8 @@ void Capture::analyze() {
 
         if (!my_dir.has_isn || (p.flag_syn() && !my_dir.saw_syn)) {
             my_dir.has_isn = true;
-            my_dir.isn = p.tcp_seq;
+            my_dir.isn = (!my_dir.syn_anywhere && my_dir.has_min_hint) ? my_dir.min_seq_hint
+                                                                       : p.tcp_seq;
             if (p.flag_syn()) {
                 my_dir.saw_syn = true;
             }
@@ -2358,6 +2617,18 @@ void Capture::analyze() {
         uint32_t rel_ack_u32 = other_dir.has_isn ? (p.tcp_ack - other_dir.isn) : 0;
         p.tcp_rel_seq = rel_seq_u32;
         p.tcp_rel_ack = rel_ack_u32;
+
+        if (p.flag_syn()) my_dir.wscale = p.tcp_opt_wscale;
+        if (!p.flag_syn() && my_dir.wscale >= 0 && other_dir.wscale >= 0) {
+            p.tcp_win_scaled = static_cast<int64_t>(p.tcp_window) << my_dir.wscale;
+        } else {
+            p.tcp_win_scaled = p.tcp_window;
+        }
+        if (p.flag_ack() && other_dir.has_isn) {
+            uint64_t ra = static_cast<uint64_t>(rel_ack_u32);
+            if (!other_dir.has_acked || ra > other_dir.acked_upto) other_dir.acked_upto = ra;
+            other_dir.has_acked = true;
+        }
 
         uint64_t seg_advance = p.tcp_payload_len;
         if (p.flag_syn()) seg_advance += 1;
@@ -2394,12 +2665,18 @@ void Capture::analyze() {
 
             if (overlaps) {
                 p.tcp_retransmission = true;
+                // Fast retransmission (RFC 5681 3.2): the peer has sent >= 2 duplicate ACKs
+                // asking for exactly this segment.
+                if (other_dir.dup_ack_streak >= 2 && other_dir.last_rel_ack_seen == rel_start) {
+                    p.tcp_fast_retransmission = true;
+                    p.info = "[TCP Fast Retransmission] " + p.info;
+                }
                 for (size_t ui = my_dir.first_unacked_idx; ui < my_dir.unacked.size(); ++ui) {
                     if (my_dir.unacked[ui].expected_rel_ack == rel_end) {
                         my_dir.unacked[ui].retransmitted = true;
                     }
                 }
-                if (p.info.find("[TCP Retransmission]") == std::string::npos) {
+                if (p.info.find("Retransmission]") == std::string::npos) {
                     p.info = "[TCP Retransmission] " + p.info;
                 }
             } else if (rel_start < my_dir.max_next_rel_seq) {
@@ -2410,6 +2687,12 @@ void Capture::analyze() {
             }
             if (rel_end > my_dir.max_next_rel_seq) {
                 my_dir.max_next_rel_seq = rel_end;
+            }
+            if (p.tcp_payload_len > 0) {
+                uint64_t base = my_dir.has_acked ? my_dir.acked_upto : (my_dir.saw_syn ? 1u : 0u);
+                p.tcp_bytes_in_flight = my_dir.max_next_rel_seq > base
+                                            ? static_cast<int64_t>(my_dir.max_next_rel_seq - base)
+                                            : 0;
             }
             my_dir.unacked.push_back({rel_end, p.timestamp, false, p.tcp_retransmission});
         } else if (p.flag_ack() && !p.flag_syn() && !p.flag_fin() && !p.flag_rst()) {
@@ -2451,6 +2734,26 @@ void Capture::analyze() {
             p.tcp_rtt_ms = measured_rtt_ms;
         }
     }
+
+    // 4. DNS response latency (Wireshark dns.time): match each response to the earliest
+    // unanswered query with the same transaction id on the reversed transport 4-tuple.
+    using DnsKey = std::tuple<std::string, uint16_t, std::string, uint16_t, uint16_t>;
+    std::map<DnsKey, double> dns_pending;
+    for (auto& p : packets_) {
+        p.dns_time_ms = -1.0;
+        if (!p.has_dns) continue;
+        uint16_t sp = p.has_udp ? p.udp_srcport : p.tcp_srcport;
+        uint16_t dp = p.has_udp ? p.udp_dstport : p.tcp_dstport;
+        if (!p.dns_is_response) {
+            dns_pending.emplace(DnsKey{p.ip_src, sp, p.ip_dst, dp, p.dns_txid}, p.timestamp);
+        } else {
+            auto it = dns_pending.find(DnsKey{p.ip_dst, dp, p.ip_src, sp, p.dns_txid});
+            if (it != dns_pending.end()) {
+                p.dns_time_ms = (p.timestamp - it->second) * 1000.0;
+                dns_pending.erase(it);
+            }
+        }
+    }
 }
 
 static bool packet_matches_protocol(const DissectedPacket& p, const std::string& proto_upper) {
@@ -2473,15 +2776,18 @@ static bool packet_matches_protocol(const DissectedPacket& p, const std::string&
     return false;
 }
 
-int64_t Capture::packet_count() const { return static_cast<int64_t>(packets_.size()); }
+int64_t Capture::packet_count() const {
+    sync(); return static_cast<int64_t>(packets_.size()); }
 
 int64_t Capture::total_bytes() const {
+    sync();
     int64_t sum = 0;
     for (const auto& p : packets_) sum += p.wire_len;
     return sum;
 }
 
 double Capture::duration() const {
+    sync();
     if (packets_.size() < 2) return 0.0;
     double tmin = packets_.front().timestamp;
     double tmax = packets_.front().timestamp;
@@ -2493,6 +2799,7 @@ double Capture::duration() const {
 }
 
 int64_t Capture::protocol_packets(const std::string& proto) const {
+    sync();
     std::string u = to_upper(trim(proto));
     int64_t cnt = 0;
     for (const auto& p : packets_) {
@@ -2502,6 +2809,7 @@ int64_t Capture::protocol_packets(const std::string& proto) const {
 }
 
 int64_t Capture::protocol_bytes(const std::string& proto) const {
+    sync();
     std::string u = to_upper(trim(proto));
     int64_t bytes = 0;
     for (const auto& p : packets_) {
@@ -2511,6 +2819,7 @@ int64_t Capture::protocol_bytes(const std::string& proto) const {
 }
 
 int64_t Capture::tcp_stream_count() const {
+    sync();
     int32_t max_id = -1;
     for (const auto& p : packets_) {
         if (p.tcp_stream > max_id) max_id = p.tcp_stream;
@@ -2519,6 +2828,7 @@ int64_t Capture::tcp_stream_count() const {
 }
 
 int64_t Capture::retransmission_count() const {
+    sync();
     int64_t c = 0;
     for (const auto& p : packets_) {
         if (p.tcp_retransmission) ++c;
@@ -2527,6 +2837,7 @@ int64_t Capture::retransmission_count() const {
 }
 
 int64_t Capture::out_of_order_count() const {
+    sync();
     int64_t c = 0;
     for (const auto& p : packets_) {
         if (p.tcp_out_of_order) ++c;
@@ -2535,6 +2846,7 @@ int64_t Capture::out_of_order_count() const {
 }
 
 int64_t Capture::dup_ack_count() const {
+    sync();
     int64_t c = 0;
     for (const auto& p : packets_) {
         if (p.tcp_dup_ack) ++c;
@@ -2543,6 +2855,7 @@ int64_t Capture::dup_ack_count() const {
 }
 
 double Capture::avg_rtt_ms() const {
+    sync();
     double sum = 0.0;
     int cnt = 0;
     for (const auto& p : packets_) {
@@ -2555,6 +2868,7 @@ double Capture::avg_rtt_ms() const {
 }
 
 double Capture::max_rtt_ms() const {
+    sync();
     double m = 0.0;
     for (const auto& p : packets_) {
         if (p.tcp_rtt_ms > m) m = p.tcp_rtt_ms;
@@ -2563,6 +2877,7 @@ double Capture::max_rtt_ms() const {
 }
 
 double Capture::min_rtt_ms() const {
+    sync();
     double m = 0.0;
     bool any = false;
     for (const auto& p : packets_) {
@@ -2648,9 +2963,11 @@ std::vector<FlowRecord> compute_flows(const std::vector<DissectedPacket>& packet
 
 } // namespace
 
-int64_t Capture::flow_count() const { return static_cast<int64_t>(compute_flows(packets_).size()); }
+int64_t Capture::flow_count() const {
+    sync(); return static_cast<int64_t>(compute_flows(packets_).size()); }
 
 int64_t Capture::unique_hosts() const {
+    sync();
     std::set<std::string> hosts;
     for (const auto& p : packets_) {
         if (!p.ip_src.empty()) hosts.insert(p.ip_src);
@@ -2672,12 +2989,17 @@ static const DissectedPacket& get_pkt_checked(const std::vector<DissectedPacket>
     return pkts[static_cast<size_t>(idx)];
 }
 
-double Capture::pkt_time(int64_t idx) const { return get_pkt_checked(packets_, idx).timestamp; }
-int64_t Capture::pkt_len(int64_t idx) const { return get_pkt_checked(packets_, idx).wire_len; }
-int64_t Capture::pkt_linktype(int64_t idx) const { return get_pkt_checked(packets_, idx).linktype; }
-std::string Capture::pkt_proto(int64_t idx) const { return get_pkt_checked(packets_, idx).protocol; }
+double Capture::pkt_time(int64_t idx) const {
+    sync(); return get_pkt_checked(packets_, idx).timestamp; }
+int64_t Capture::pkt_len(int64_t idx) const {
+    sync(); return get_pkt_checked(packets_, idx).wire_len; }
+int64_t Capture::pkt_linktype(int64_t idx) const {
+    sync(); return get_pkt_checked(packets_, idx).linktype; }
+std::string Capture::pkt_proto(int64_t idx) const {
+    sync(); return get_pkt_checked(packets_, idx).protocol; }
 
 std::string Capture::pkt_src(int64_t idx) const {
+    sync();
     const auto& p = get_pkt_checked(packets_, idx);
     if (!p.ip_src.empty()) return p.ip_src;
     if (p.has_arp) return p.arp_sender_ip;
@@ -2685,6 +3007,7 @@ std::string Capture::pkt_src(int64_t idx) const {
 }
 
 std::string Capture::pkt_dst(int64_t idx) const {
+    sync();
     const auto& p = get_pkt_checked(packets_, idx);
     if (!p.ip_dst.empty()) return p.ip_dst;
     if (p.has_arp) return p.arp_target_ip;
@@ -2692,21 +3015,25 @@ std::string Capture::pkt_dst(int64_t idx) const {
 }
 
 int64_t Capture::pkt_srcport(int64_t idx) const {
+    sync();
     const auto& p = get_pkt_checked(packets_, idx);
     return p.has_tcp ? p.tcp_srcport : (p.has_udp ? p.udp_srcport : 0);
 }
 
 int64_t Capture::pkt_dstport(int64_t idx) const {
+    sync();
     const auto& p = get_pkt_checked(packets_, idx);
     return p.has_tcp ? p.tcp_dstport : (p.has_udp ? p.udp_dstport : 0);
 }
 
 int64_t Capture::pkt_vlan(int64_t idx) const {
+    sync();
     const auto& p = get_pkt_checked(packets_, idx);
     return p.has_vlan ? p.vlan_id : 0;
 }
 
-std::string Capture::pkt_info(int64_t idx) const { return get_pkt_checked(packets_, idx).info; }
+std::string Capture::pkt_info(int64_t idx) const {
+    sync(); return get_pkt_checked(packets_, idx).info; }
 
 static std::string extract_packet_field(const DissectedPacket& p, const std::string& field_raw) {
     std::string f = to_lower(trim(field_raw));
@@ -2714,12 +3041,16 @@ static std::string extract_packet_field(const DissectedPacket& p, const std::str
     if (f == "frame.len" || f == "length") return std::to_string(p.wire_len);
     if (f == "frame.cap_len") return std::to_string(p.cap_len);
     if (f == "frame.time" || f == "time") return std::to_string(p.timestamp);
+    if (f == "frame.time_epoch_ns") return std::to_string(p.ts_ns);
     if (f == "frame.protocols" || f == "protocol") return p.protocol;
     if (f == "frame.linktype") return std::to_string(p.linktype);
     if (f == "eth.src") return p.has_eth ? p.eth_src : "";
     if (f == "eth.dst") return p.has_eth ? p.eth_dst : "";
     if (f == "eth.type") return p.has_eth ? std::to_string(p.eth_type) : "";
     if (f == "vlan.id") return p.has_vlan ? std::to_string(p.vlan_id) : "";
+    if (f == "vlan.inner_id")
+        return p.vlan_ids.size() >= 2 ? std::to_string(p.vlan_ids.back()) : "";
+    if (f == "vlan.count") return std::to_string(p.vlan_ids.size());
     if (f == "arp.opcode") return p.has_arp ? std::to_string(p.arp_opcode) : "";
     if (f == "arp.src.proto_ipv4" || f == "arp.sender_ip")
         return p.has_arp ? p.arp_sender_ip : "";
@@ -2772,8 +3103,31 @@ static std::string extract_packet_field(const DissectedPacket& p, const std::str
     if (f == "tcp.rel_seq") return p.has_tcp ? std::to_string(p.tcp_rel_seq) : "";
     if (f == "tcp.ack") return p.has_tcp ? std::to_string(p.tcp_ack) : "";
     if (f == "tcp.rel_ack") return p.has_tcp ? std::to_string(p.tcp_rel_ack) : "";
-    if (f == "tcp.window" || f == "tcp.window_size")
+    if (f == "tcp.window" || f == "tcp.window_size_value")
         return p.has_tcp ? std::to_string(p.tcp_window) : "";
+    if (f == "tcp.window_size")
+        return p.has_tcp ? std::to_string(p.tcp_win_scaled >= 0 ? p.tcp_win_scaled
+                                                                : static_cast<int64_t>(p.tcp_window))
+                         : "";
+    if (f == "tcp.hdr_len") return p.has_tcp ? std::to_string(p.tcp_hdr_len) : "";
+    if (f == "tcp.options.mss_val")
+        return (p.has_tcp && p.tcp_opt_mss >= 0) ? std::to_string(p.tcp_opt_mss) : "";
+    if (f == "tcp.options.wscale.shift")
+        return (p.has_tcp && p.tcp_opt_wscale >= 0) ? std::to_string(p.tcp_opt_wscale) : "";
+    if (f == "tcp.options.wscale.multiplier")
+        return (p.has_tcp && p.tcp_opt_wscale >= 0) ? std::to_string(1 << p.tcp_opt_wscale) : "";
+    if (f == "tcp.options.sack_perm")
+        return p.has_tcp ? (p.tcp_opt_sack_perm ? "1" : "0") : "";
+    if (f == "tcp.options.sack") return p.has_tcp ? p.tcp_opt_sack : "";
+    if (f == "tcp.options.timestamp.tsval")
+        return (p.has_tcp && p.tcp_opt_has_ts) ? std::to_string(p.tcp_opt_tsval) : "";
+    if (f == "tcp.options.timestamp.tsecr")
+        return (p.has_tcp && p.tcp_opt_has_ts) ? std::to_string(p.tcp_opt_tsecr) : "";
+    if (f == "tcp.analysis.bytes_in_flight")
+        return (p.has_tcp && p.tcp_bytes_in_flight >= 0) ? std::to_string(p.tcp_bytes_in_flight)
+                                                         : "";
+    if (f == "tcp.analysis.fast_retransmission")
+        return p.has_tcp ? (p.tcp_fast_retransmission ? "true" : "false") : "";
     if (f == "tcp.len") return p.has_tcp ? std::to_string(p.tcp_payload_len) : "";
     if (f == "tcp.stream") return p.has_tcp ? std::to_string(p.tcp_stream) : "";
     if (f == "tcp.flags") return p.has_tcp ? format_tcp_flags(p.tcp_flags) : "";
@@ -2807,7 +3161,22 @@ static std::string extract_packet_field(const DissectedPacket& p, const std::str
     if (f == "udp.checksum_ok") return p.has_udp ? (p.udp_checksum_ok ? "true" : "false") : "";
     if (f == "dns.qname" || f == "dns.qry.name") return p.dns_qname;
     if (f == "dns.qtype" || f == "dns.qry.type") return p.dns_qtype;
-    if (f == "dns.answer" || f == "dns.a" || f == "dns.aaaa") return p.dns_answer;
+    if (f == "dns.answer" || f == "dns.resp") return p.dns_answer;
+    if (f == "dns.a" || f == "dns.aaaa" || f == "dns.cname") {
+        std::string want = f == "dns.a" ? "A" : (f == "dns.aaaa" ? "AAAA" : "CNAME");
+        for (size_t k = 0; k < p.dns_answer_types.size(); ++k) {
+            if (p.dns_answer_types[k] == want) return p.dns_answers[k];
+        }
+        return "";
+    }
+    if (f == "dns.count.answers") return p.has_dns ? std::to_string(p.dns_ancount) : "";
+    if (f == "dns.flags.response") return p.has_dns ? (p.dns_is_response ? "1" : "0") : "";
+    if (f == "dns.time") {
+        if (!p.has_dns || p.dns_time_ms < 0.0) return "";
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3) << p.dns_time_ms;
+        return oss.str();
+    }
     if (f == "dns.rcode" || f == "dns.flags.rcode")
         return p.has_dns ? std::to_string(p.dns_rcode) : "";
     if (f == "dns.txid" || f == "dns.id") return p.has_dns ? std::to_string(p.dns_txid) : "";
@@ -2829,6 +3198,21 @@ static std::string extract_packet_field(const DissectedPacket& p, const std::str
     if (f == "ntp.stratum") return p.has_ntp ? std::to_string(p.ntp_stratum) : "";
     if (f == "ntp.mode") return p.has_ntp ? std::to_string(p.ntp_mode) : "";
     if (f == "ntp.ref_id") return p.ntp_ref_id;
+    if (f == "ntp.version") return p.has_ntp ? std::to_string(p.ntp_version) : "";
+    if (f == "tls.cipher_suite")
+        return (p.has_tls && p.tls_cipher_suite) ? std::to_string(p.tls_cipher_suite) : "";
+    if (f == "tls.record.version") return p.tls_record_version;
+    if (f == "http.status_text") return p.http_status_text;
+    if (f == "http.content_length")
+        return p.has_http && p.http_content_length >= 0 ? std::to_string(p.http_content_length) : "";
+    if (f == "dhcp.xid") return p.has_dhcp ? std::to_string(p.dhcp_xid) : "";
+    if (f == "dhcp.chaddr") return p.dhcp_chaddr;
+    if (f == "dhcp.ciaddr") return p.dhcp_ciaddr;
+    if (f == "dhcp.siaddr") return p.dhcp_siaddr;
+    if (f == "icmp.id" || f == "icmpv6.id")
+        return (p.has_icmp || p.has_icmpv6) ? std::to_string(p.icmp_id) : "";
+    if (f == "udp.payload_len") return p.has_udp ? std::to_string(p.udp_payload_len) : "";
+    if (f == "frame.info" || f == "info") return p.info;
     if (f == "quic.version") return p.quic_version;
     if (f == "quic.type") return p.quic_packet_type;
     if (f == "quic.dcid") return p.quic_dcid;
@@ -2836,60 +3220,141 @@ static std::string extract_packet_field(const DissectedPacket& p, const std::str
     return "";
 }
 
+static const std::set<std::string>& known_display_fields() {
+    static const std::set<std::string> k = {
+    "arp", "arp.dst.hw_mac", "arp.dst.proto_ipv4", "arp.opcode", "arp.sender_ip",
+    "arp.sender_mac", "arp.src.hw_mac", "arp.src.proto_ipv4", "arp.target_ip", "arp.target_mac",
+    "bootp", "dhcp", "dhcp.chaddr", "dhcp.ciaddr", "dhcp.hostname", "dhcp.option.dhcp",
+    "dhcp.siaddr", "dhcp.type", "dhcp.xid", "dhcp.yiaddr", "dns", "dns.a", "dns.aaaa",
+    "dns.answer", "dns.cname", "dns.count.answers", "dns.flags.rcode", "dns.flags.response",
+    "dns.id", "dns.qname", "dns.qry.name", "dns.qry.type", "dns.qtype", "dns.rcode", "dns.resp",
+    "dns.time", "dns.txid", "eth", "eth.addr", "eth.dst", "eth.src", "eth.type", "ethernet",
+    "frame", "frame.cap_len", "frame.info", "frame.len", "frame.linktype", "frame.number",
+    "frame.protocols", "frame.time", "frame.time_epoch_ns", "http", "http.body",
+    "http.content_length", "http.content_type", "http.host", "http.method",
+    "http.request.method", "http.request.uri", "http.response.code", "http.status",
+    "http.status_text", "http.uri", "icmp", "icmp.checksum_ok", "icmp.code", "icmp.id",
+    "icmp.seq", "icmp.type", "icmp6", "icmpv6", "icmpv6.checksum_ok", "icmpv6.code",
+    "icmpv6.id", "icmpv6.seq", "icmpv6.type", "info", "ip", "ip.addr", "ip.checksum_ok",
+    "ip.dst", "ip.flags.df", "ip.flags.mf", "ip.frag_offset", "ip.fragmented", "ip.id",
+    "ip.len", "ip.proto", "ip.reassembled", "ip.reassembled_len", "ip.src", "ip.ttl",
+    "ip.version", "ip6", "ipv4", "ipv6", "ipv6.addr", "ipv6.dst", "ipv6.flags.mf",
+    "ipv6.frag_id", "ipv6.frag_offset", "ipv6.fragmented", "ipv6.hlim", "ipv6.reassembled",
+    "ipv6.reassembled_len", "ipv6.src", "length", "no", "ntp", "ntp.mode", "ntp.ref_id",
+    "ntp.stratum", "ntp.version", "protocol", "quic", "quic.dcid", "quic.scid", "quic.type",
+    "quic.version", "raw", "ssl", "tcp", "tcp.ack", "tcp.analysis.ack_rtt",
+    "tcp.analysis.bytes_in_flight", "tcp.analysis.duplicate_ack",
+    "tcp.analysis.fast_retransmission", "tcp.analysis.out_of_order",
+    "tcp.analysis.retransmission", "tcp.analysis.zero_window", "tcp.checksum_ok", "tcp.dstport",
+    "tcp.flags", "tcp.flags.ack", "tcp.flags.cwr", "tcp.flags.ece", "tcp.flags.fin",
+    "tcp.flags.ns", "tcp.flags.psh", "tcp.flags.rst", "tcp.flags.syn", "tcp.flags.urg",
+    "tcp.hdr_len", "tcp.len", "tcp.options.mss_val", "tcp.options.sack",
+    "tcp.options.sack_perm", "tcp.options.timestamp.tsecr", "tcp.options.timestamp.tsval",
+    "tcp.options.wscale.multiplier", "tcp.options.wscale.shift", "tcp.port", "tcp.rel_ack",
+    "tcp.rel_seq", "tcp.rtt_ms", "tcp.seq", "tcp.srcport", "tcp.stream", "tcp.window",
+    "tcp.window_size", "tcp.window_size_value", "time", "tls", "tls.alpn", "tls.cipher_suite",
+    "tls.handshake.extensions_server_name", "tls.handshake.type", "tls.record.version",
+    "tls.sni", "tls.version", "udp", "udp.checksum_ok", "udp.dstport", "udp.length",
+    "udp.payload_len", "udp.port", "udp.srcport", "vlan", "vlan.count", "vlan.id",
+    "vlan.inner_id",
+    };
+    return k;
+}
+
 std::string Capture::pkt_field(int64_t idx, const std::string& field) const {
+    sync();
+    if (!known_display_fields().count(to_lower(trim(field)))) {
+        throw std::runtime_error("Unknown field '" + field + "' in pkt_field (see README field list)");
+    }
     return extract_packet_field(get_pkt_checked(packets_, idx), field);
 }
 
-static std::map<uint32_t, uint8_t> build_direction_byte_map(
-    const std::vector<DissectedPacket>& packets, int64_t stream_id, bool from_initiator) {
-    std::map<uint32_t, uint8_t> byte_map;
+// Reassemble one direction of a TCP stream from (relative offset, bytes) segments.
+// Segments are applied in capture order with "first copy wins" for overlapping bytes
+// (retransmitted data never overwrites what was delivered first). Coverage is tracked as
+// disjoint intervals, so memory is linear in captured payload, not in the sequence span.
+struct ReassemblyPiece { uint64_t off; const uint8_t* ptr; uint64_t len; };
+
+static std::vector<ReassemblyPiece> reassemble_dir(const std::vector<DissectedPacket>& packets,
+                                                   int64_t stream_id, bool from_initiator) {
+    std::map<uint64_t, uint64_t> covered; // start -> end (exclusive), disjoint
+    std::vector<ReassemblyPiece> pieces;
     for (const auto& p : packets) {
         if (!p.has_tcp || p.tcp_stream != stream_id || p.tcp_from_initiator != from_initiator) {
             continue;
         }
         if (p.tcp_payload_len == 0) continue;
-        uint32_t base_rel = p.tcp_rel_seq;
-        // Subtract 1 for SYN only when a SYN was actually seen on this direction
-        if (p.tcp_saw_syn && !p.flag_syn() && base_rel > 0) {
-            base_rel -= 1;
-        }
+        uint64_t base_rel = p.tcp_rel_seq;
+        // Payload starts one past the SYN only when this direction's ISN came from a SYN.
+        if (p.tcp_saw_syn && !p.flag_syn() && base_rel > 0) base_rel -= 1;
         const auto& src_buf = !p.reassembled_l4.empty() ? p.reassembled_l4 : p.raw;
-        for (uint32_t i = 0; i < p.tcp_payload_len; ++i) {
-            if (p.tcp_payload_offset + i >= src_buf.size()) break;
-            uint32_t pos = base_rel + i;
-            if (byte_map.find(pos) == byte_map.end()) {
-                byte_map[pos] = src_buf[p.tcp_payload_offset + i];
+        if (p.tcp_payload_offset >= src_buf.size()) continue;
+        uint64_t len = std::min<uint64_t>(p.tcp_payload_len, src_buf.size() - p.tcp_payload_offset);
+        const uint8_t* ptr = src_buf.data() + p.tcp_payload_offset;
+        uint64_t s0 = base_rel, e0 = base_rel + len;
+        // Emit the parts of [s0, e0) not yet covered.
+        uint64_t cur = s0;
+        auto it = covered.upper_bound(s0);
+        if (it != covered.begin()) {
+            auto pv = std::prev(it);
+            if (pv->second > cur) cur = std::min(e0, pv->second);
+        }
+        while (cur < e0) {
+            uint64_t next_start = (it != covered.end()) ? it->first : e0;
+            if (next_start > cur) {
+                uint64_t stop = std::min(e0, next_start);
+                pieces.push_back({cur, ptr + (cur - s0), stop - cur});
+                cur = stop;
+            }
+            if (it != covered.end() && it->first <= cur) {
+                cur = std::max(cur, std::min(e0, it->second));
+                ++it;
             }
         }
+        // Merge [s0, e0) into the coverage map.
+        uint64_t ns = s0, ne = e0;
+        auto lo = covered.upper_bound(ns);
+        if (lo != covered.begin() && std::prev(lo)->second >= ns) --lo;
+        while (lo != covered.end() && lo->first <= ne) {
+            ns = std::min(ns, lo->first);
+            ne = std::max(ne, lo->second);
+            lo = covered.erase(lo);
+        }
+        covered[ns] = ne;
     }
-    return byte_map;
+    std::sort(pieces.begin(), pieces.end(),
+              [](const ReassemblyPiece& x, const ReassemblyPiece& y) { return x.off < y.off; });
+    return pieces;
 }
 
 static std::string reassemble_direction(const std::vector<DissectedPacket>& packets,
                                         int64_t stream_id, bool from_initiator) {
-    auto byte_map = build_direction_byte_map(packets, stream_id, from_initiator);
-    if (byte_map.empty()) return "";
+    auto pieces = reassemble_dir(packets, stream_id, from_initiator);
+    uint64_t total = 0;
+    for (const auto& pc : pieces) total += pc.len;
+    membudget::require(total + 64 * pieces.size());
     std::string out;
-    out.reserve(byte_map.size());
-    uint32_t expected_pos = 0;
-    for (const auto& kv : byte_map) {
-        if (kv.first > expected_pos) {
-            uint32_t gap = kv.first - expected_pos;
-            out += "[<" + std::to_string(gap) + " bytes missing>]";
+    out.reserve(static_cast<size_t>(total));
+    uint64_t expected = 0;
+    for (const auto& pc : pieces) {
+        if (pc.off > expected) {
+            out += "[<" + std::to_string(pc.off - expected) + " bytes missing>]";
         }
-        out.push_back(static_cast<char>(kv.second));
-        expected_pos = kv.first + 1;
+        out.append(reinterpret_cast<const char*>(pc.ptr), static_cast<size_t>(pc.len));
+        expected = pc.off + pc.len;
     }
     return out;
 }
 
 static int64_t reassemble_direction_bytes(const std::vector<DissectedPacket>& packets,
                                           int64_t stream_id, bool from_initiator) {
-    return static_cast<int64_t>(
-        build_direction_byte_map(packets, stream_id, from_initiator).size());
+    uint64_t total = 0;
+    for (const auto& pc : reassemble_dir(packets, stream_id, from_initiator)) total += pc.len;
+    return static_cast<int64_t>(total);
 }
 
 std::string Capture::tcp_stream_text(int64_t stream_id, const std::string& direction) const {
+    sync();
     std::string d = to_lower(trim(direction));
     if (d == "client" || d == "c2s" || d == "request") {
         return reassemble_direction(packets_, stream_id, true);
@@ -2902,6 +3367,7 @@ std::string Capture::tcp_stream_text(int64_t stream_id, const std::string& direc
 }
 
 int64_t Capture::tcp_stream_bytes(int64_t stream_id, const std::string& direction) const {
+    sync();
     std::string d = to_lower(trim(direction));
     if (d == "client" || d == "c2s" || d == "request") {
         return reassemble_direction_bytes(packets_, stream_id, true);
@@ -2914,6 +3380,7 @@ int64_t Capture::tcp_stream_bytes(int64_t stream_id, const std::string& directio
 }
 
 int64_t Capture::tcp_stream_packets(int64_t stream_id) const {
+    sync();
     int64_t c = 0;
     for (const auto& p : packets_) {
         if (p.has_tcp && p.tcp_stream == stream_id) ++c;
@@ -2922,6 +3389,7 @@ int64_t Capture::tcp_stream_packets(int64_t stream_id) const {
 }
 
 int64_t Capture::tcp_stream_retransmissions(int64_t stream_id) const {
+    sync();
     int64_t c = 0;
     for (const auto& p : packets_) {
         if (p.has_tcp && p.tcp_stream == stream_id && p.tcp_retransmission) ++c;
@@ -2930,6 +3398,7 @@ int64_t Capture::tcp_stream_retransmissions(int64_t stream_id) const {
 }
 
 double Capture::tcp_stream_rtt_ms(int64_t stream_id) const {
+    sync();
     double sum = 0.0;
     int cnt = 0;
     for (const auto& p : packets_) {
@@ -2944,7 +3413,7 @@ double Capture::tcp_stream_rtt_ms(int64_t stream_id) const {
 namespace {
 
 struct FilterToken {
-    enum Type { IDENT, STRING, NUMBER, OP, LPAREN, RPAREN, END } type = END;
+    enum Type { IDENT, STRING, NUMBER, OP, LPAREN, RPAREN, LBRACE, RBRACE, END } type = END;
     std::string text;
 };
 
@@ -2967,6 +3436,20 @@ std::vector<FilterToken> tokenize_filter(const std::string& expr) {
             ++i;
             continue;
         }
+        if (c == '{' || c == '}') {
+            toks.push_back({c == '{' ? FilterToken::LBRACE : FilterToken::RBRACE, std::string(1, c)});
+            ++i;
+            continue;
+        }
+        if (c == '~') {
+            toks.push_back({FilterToken::OP, "matches"});
+            ++i;
+            continue;
+        }
+        if (c == ',') { // set separator in "in {a, b}"
+            ++i;
+            continue;
+        }
         if (c == '"' || c == '\'') {
             char quote = c;
             ++i;
@@ -2977,7 +3460,10 @@ std::vector<FilterToken> tokenize_filter(const std::string& expr) {
                 }
                 s.push_back(expr[i++]);
             }
-            if (i < expr.size() && expr[i] == quote) ++i;
+            if (i >= expr.size()) {
+                throw std::runtime_error("Unterminated string literal in filter: " + expr);
+            }
+            ++i;
             toks.push_back({FilterToken::STRING, s});
             continue;
         }
@@ -3001,8 +3487,13 @@ std::vector<FilterToken> tokenize_filter(const std::string& expr) {
         size_t start = i;
         while (i < expr.size() && !std::isspace(static_cast<unsigned char>(expr[i])) &&
                expr[i] != '(' && expr[i] != ')' && expr[i] != '!' && expr[i] != '<' &&
-               expr[i] != '>' && expr[i] != '=' && expr[i] != '&' && expr[i] != '|') {
+               expr[i] != '>' && expr[i] != '=' && expr[i] != '&' && expr[i] != '|' &&
+               expr[i] != '{' && expr[i] != '}' && expr[i] != '~' && expr[i] != ',') {
             ++i;
+        }
+        if (i == start) {
+            throw std::runtime_error(std::string("Unexpected character '") + expr[i] +
+                                     "' in filter: " + expr);
         }
         std::string word = expr.substr(start, i - start);
         std::string lw = to_lower(word);
@@ -3026,6 +3517,10 @@ std::vector<FilterToken> tokenize_filter(const std::string& expr) {
             toks.push_back({FilterToken::OP, ">="});
         } else if (lw == "contains") {
             toks.push_back({FilterToken::OP, "contains"});
+        } else if (lw == "matches") {
+            toks.push_back({FilterToken::OP, "matches"});
+        } else if (lw == "in") {
+            toks.push_back({FilterToken::OP, "in"});
         } else {
             toks.push_back({FilterToken::IDENT, word});
         }
@@ -3037,8 +3532,8 @@ std::vector<FilterToken> tokenize_filter(const std::string& expr) {
 bool compare_single_value(const std::string& lhs, const std::string& op, const std::string& rhs,
                           bool case_insensitive = false) {
     if (lhs.empty() && op != "!=") return false;
-    if (op == "contains") {
-        return to_lower(lhs).find(to_lower(rhs)) != std::string::npos;
+    if (op == "contains") { // case-sensitive substring, as in Wireshark
+        return lhs.find(rhs) != std::string::npos;
     }
     char* end_l = nullptr;
     char* end_r = nullptr;
@@ -3149,85 +3644,233 @@ bool eval_display_atom(const DissectedPacket& p, const std::string& field_raw,
     return false;
 }
 
-class DisplayFilterParser {
-public:
-    DisplayFilterParser(const std::vector<FilterToken>& toks, const DissectedPacket& pkt)
-        : toks_(toks), pkt_(pkt) {}
+// Display filters are compiled once into a small AST (precedence: ! > && > ||, as in
+// Wireshark 4) and evaluated per packet. Compilation validates field names, operators,
+// set literals and regular expressions, so a bad filter fails even on an empty capture.
+struct DfNode {
+    enum Kind { OR, AND, NOT, ATOM } kind = ATOM;
+    std::unique_ptr<DfNode> a, b;
+    std::string field, op, rhs;
+    std::vector<std::pair<std::string, std::string>> set; // "in": (value, range-high or "")
+    std::shared_ptr<std::regex> re;
+};
 
-    bool parse() {
-        if (toks_.empty() || toks_[0].type == FilterToken::END) return true;
-        bool res = parse_or();
+class DisplayFilterCompiler {
+public:
+    explicit DisplayFilterCompiler(const std::vector<FilterToken>& toks) : toks_(toks) {}
+
+    std::unique_ptr<DfNode> compile() {
+        if (toks_.empty() || toks_[0].type == FilterToken::END) return nullptr;
+        auto n = parse_or();
         if (peek().type != FilterToken::END) {
             throw std::runtime_error("Unexpected token in display filter: " + peek().text);
         }
-        return res;
+        return n;
     }
 
 private:
     const FilterToken& peek() const { return toks_[pos_]; }
     const FilterToken& consume() { return toks_[pos_++]; }
-
-    bool parse_or() {
-        bool left = parse_and();
-        while (peek().type == FilterToken::OP && peek().text == "||") {
-            consume();
-            bool right = parse_and();
-            left = left || right;
-        }
-        return left;
+    bool is_op(const char* t) const {
+        return peek().type == FilterToken::OP && peek().text == t;
     }
-
-    bool parse_and() {
-        bool left = parse_not();
-        while (peek().type == FilterToken::OP && peek().text == "&&") {
-            consume();
-            bool right = parse_not();
-            left = left && right;
-        }
-        return left;
+    static std::unique_ptr<DfNode> bin(DfNode::Kind k, std::unique_ptr<DfNode> l,
+                                       std::unique_ptr<DfNode> r) {
+        auto n = std::make_unique<DfNode>();
+        n->kind = k;
+        n->a = std::move(l);
+        n->b = std::move(r);
+        return n;
     }
-
-    bool parse_not() {
-        if (peek().type == FilterToken::OP && peek().text == "!") {
+    std::unique_ptr<DfNode> parse_or() {
+        auto l = parse_and();
+        while (is_op("||")) {
             consume();
-            return !parse_not();
+            l = bin(DfNode::OR, std::move(l), parse_and());
+        }
+        return l;
+    }
+    std::unique_ptr<DfNode> parse_and() {
+        auto l = parse_not();
+        while (is_op("&&")) {
+            consume();
+            l = bin(DfNode::AND, std::move(l), parse_not());
+        }
+        return l;
+    }
+    std::unique_ptr<DfNode> parse_not() {
+        if (is_op("!")) {
+            consume();
+            if (++depth_ > 256) throw std::runtime_error("Display filter nested too deeply");
+            auto n = std::make_unique<DfNode>();
+            n->kind = DfNode::NOT;
+            n->a = parse_not();
+            --depth_;
+            return n;
         }
         return parse_primary();
     }
-
-    bool parse_primary() {
+    std::unique_ptr<DfNode> parse_primary() {
         if (peek().type == FilterToken::LPAREN) {
             consume();
-            bool v = parse_or();
+            if (++depth_ > 256) throw std::runtime_error("Display filter nested too deeply");
+            auto v = parse_or();
+            --depth_;
             if (peek().type != FilterToken::RPAREN) {
                 throw std::runtime_error("Missing closing ')' in display filter");
             }
             consume();
             return v;
         }
-        if (peek().type != FilterToken::IDENT && peek().type != FilterToken::STRING) {
+        if (peek().type != FilterToken::IDENT) {
             throw std::runtime_error("Expected field or protocol in display filter, got: " +
-                                     peek().text);
+                                     (peek().text.empty() ? std::string("end of filter")
+                                                          : peek().text));
         }
-        std::string field = consume().text;
-        if (peek().type == FilterToken::OP && peek().text != "&&" && peek().text != "||" &&
-            peek().text != "!") {
-            std::string op = consume().text;
+        auto n = std::make_unique<DfNode>();
+        n->field = to_lower(trim(consume().text));
+        if (!known_display_fields().count(n->field)) {
+            throw std::runtime_error("Unknown field or protocol '" + n->field +
+                                     "' in display filter");
+        }
+        if (peek().type == FilterToken::OP && !is_op("&&") && !is_op("||") && !is_op("!")) {
+            n->op = consume().text;
+            if (n->op == "in") {
+                if (peek().type != FilterToken::LBRACE) {
+                    throw std::runtime_error("Expected '{' after 'in' in display filter");
+                }
+                consume();
+                while (peek().type == FilterToken::IDENT || peek().type == FilterToken::STRING) {
+                    bool quoted = peek().type == FilterToken::STRING;
+                    std::string v = consume().text;
+                    size_t dd = quoted ? std::string::npos : v.find("..");
+                    if (dd != std::string::npos) {
+                        n->set.push_back({v.substr(0, dd), v.substr(dd + 2)});
+                    } else {
+                        n->set.push_back({v, ""});
+                    }
+                }
+                if (peek().type != FilterToken::RBRACE) {
+                    throw std::runtime_error("Expected '}' to close set in display filter");
+                }
+                consume();
+                if (n->set.empty()) throw std::runtime_error("Empty set after 'in' in display filter");
+                return n;
+            }
             if (peek().type != FilterToken::IDENT && peek().type != FilterToken::STRING &&
                 peek().type != FilterToken::NUMBER) {
-                throw std::runtime_error("Expected value after operator '" + op +
+                throw std::runtime_error("Expected value after operator '" + n->op +
                                          "' in display filter");
             }
-            std::string rhs = consume().text;
-            return eval_display_atom(pkt_, field, op, rhs);
+            n->rhs = consume().text;
+            if (n->op == "matches") {
+                std::string pat = n->rhs;
+                auto flags = std::regex::ECMAScript;
+                if (pat.compare(0, 4, "(?i)") == 0) {
+                    pat = pat.substr(4);
+                    flags |= std::regex::icase;
+                }
+                if (pat.size() > 512) throw std::runtime_error("Regular expression too long (max 512)");
+                try {
+                    n->re = std::make_shared<std::regex>(pat, flags);
+                } catch (const std::regex_error& e) {
+                    throw std::runtime_error("Invalid regular expression in 'matches': " + n->rhs);
+                }
+            }
         }
-        return eval_display_atom(pkt_, field, "", "");
+        return n;
     }
 
     const std::vector<FilterToken>& toks_;
-    const DissectedPacket& pkt_;
     size_t pos_ = 0;
+    int depth_ = 0;
 };
+
+static std::vector<std::string> display_candidates(const DissectedPacket& p, const std::string& f) {
+    std::vector<std::string> c;
+    if (f == "ip.addr" || f == "ipv6.addr") {
+        bool ok = f == "ip.addr" ? (p.has_ipv4 || p.has_ipv6) : p.has_ipv6;
+        if (ok && !p.ip_src.empty()) c.push_back(p.ip_src);
+        if (ok && !p.ip_dst.empty()) c.push_back(p.ip_dst);
+    } else if (f == "eth.addr") {
+        if (p.has_eth) { c.push_back(p.eth_src); c.push_back(p.eth_dst); }
+    } else if (f == "tcp.port") {
+        if (p.has_tcp) { c.push_back(std::to_string(p.tcp_srcport)); c.push_back(std::to_string(p.tcp_dstport)); }
+    } else if (f == "udp.port") {
+        if (p.has_udp) { c.push_back(std::to_string(p.udp_srcport)); c.push_back(std::to_string(p.udp_dstport)); }
+    } else if (f == "vlan.id") {
+        for (auto v : p.vlan_ids) c.push_back(std::to_string(v));
+    } else if (f == "dns.a" || f == "dns.aaaa" || f == "dns.cname") {
+        std::string want = f == "dns.a" ? "A" : (f == "dns.aaaa" ? "AAAA" : "CNAME");
+        for (size_t k = 0; k < p.dns_answer_types.size(); ++k)
+            if (p.dns_answer_types[k] == want) c.push_back(p.dns_answers[k]);
+    } else if (f == "dns.answer" || f == "dns.resp") {
+        c = p.dns_answers;
+    } else {
+        std::string v = extract_packet_field(p, f);
+        if (!v.empty()) c.push_back(v);
+    }
+    return c;
+}
+
+bool ipv4_matches_cidr(const std::string& ip_str, const std::string& cidr_str);
+
+static bool eval_df(const DfNode* n, const DissectedPacket& p) {
+    if (!n) return true;
+    switch (n->kind) {
+        case DfNode::OR: return eval_df(n->a.get(), p) || eval_df(n->b.get(), p);
+        case DfNode::AND: return eval_df(n->a.get(), p) && eval_df(n->b.get(), p);
+        case DfNode::NOT: return !eval_df(n->a.get(), p);
+        case DfNode::ATOM: break;
+    }
+    if (n->op == "in") {
+        bool ci = (n->field == "frame.protocols" || n->field == "protocol");
+        for (const auto& c : display_candidates(p, n->field)) {
+            for (const auto& item : n->set) {
+                if (item.second.empty()) {
+                    if (compare_single_value(c, "==", item.first, ci)) return true;
+                } else if (compare_single_value(c, ">=", item.first) &&
+                           compare_single_value(c, "<=", item.second)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    if (n->op == "matches") {
+        for (const auto& c : display_candidates(p, n->field)) {
+            if (std::regex_search(c, *n->re)) return true;
+        }
+        return false;
+    }
+    if ((n->op == "==" || n->op == "!=") && n->rhs.find('/') != std::string::npos &&
+        (n->field == "ip.addr" || n->field == "ip.src" || n->field == "ip.dst")) {
+        auto cands = display_candidates(p, n->field);
+        if (cands.empty()) return false;
+        bool any = false;
+        for (const auto& c : cands) any = any || ipv4_matches_cidr(c, n->rhs);
+        return n->op == "==" ? any : !any;
+    }
+    if (n->field == "vlan.id" || n->field == "dns.a" || n->field == "dns.aaaa" ||
+        n->field == "dns.cname" || n->field == "dns.answer" || n->field == "dns.resp") {
+        if (n->op.empty()) return !display_candidates(p, n->field).empty();
+        auto cands = display_candidates(p, n->field);
+        if (cands.empty()) return false;
+        if (n->op == "!=") {
+            for (const auto& c : cands) if (!compare_single_value(c, "!=", n->rhs)) return false;
+            return true;
+        }
+        for (const auto& c : cands) if (compare_single_value(c, n->op, n->rhs)) return true;
+        return false;
+    }
+    return eval_display_atom(p, n->field, n->op, n->rhs);
+}
+
+static std::unique_ptr<DfNode> compile_display_filter(const std::string& expr) {
+    if (expr.size() > 4096) throw std::runtime_error("Display filter too long (max 4096 chars)");
+    auto toks = tokenize_filter(expr);
+    return DisplayFilterCompiler(toks).compile();
+}
 
 bool ipv4_matches_cidr(const std::string& ip_str, const std::string& cidr_str) {
     size_t slash = cidr_str.find('/');
@@ -3418,26 +4061,30 @@ private:
 } // namespace
 
 Capture Capture::filter(const std::string& expr) const {
-    auto toks = tokenize_filter(expr);
-    if (packets_.empty()) {
-        DissectedPacket dummy;
-        DisplayFilterParser parser(toks, dummy);
-        (void)parser.parse();
-    }
+    sync();
+    auto prog = compile_display_filter(expr);
     Capture out;
     out.default_src_mac_ = default_src_mac_;
     out.default_dst_mac_ = default_dst_mac_;
     out.default_vlan_id_ = default_vlan_id_;
     for (const auto& p : packets_) {
-        DisplayFilterParser parser(toks, p);
-        if (parser.parse()) {
+        if (eval_df(prog.get(), p)) {
             out.packets_.push_back(p);
         }
     }
     return out;
 }
 
+int64_t Capture::count(const std::string& display_filter) const {
+    sync();
+    auto prog = compile_display_filter(display_filter);
+    int64_t n = 0;
+    for (const auto& p : packets_) n += eval_df(prog.get(), p) ? 1 : 0;
+    return n;
+}
+
 Capture Capture::bpf(const std::string& expr) const {
+    sync();
     auto toks = tokenize_filter(expr);
     if (packets_.empty()) {
         DissectedPacket dummy;
@@ -3459,6 +4106,7 @@ Capture Capture::bpf(const std::string& expr) const {
 }
 
 Capture Capture::slice_time(double t_start, double t_end) const {
+    sync();
     Capture out;
     out.default_src_mac_ = default_src_mac_;
     out.default_dst_mac_ = default_dst_mac_;
@@ -3472,25 +4120,29 @@ Capture Capture::slice_time(double t_start, double t_end) const {
 }
 
 Capture Capture::merge(const Capture& other) const {
+    sync();
     Capture out;
     out.default_src_mac_ = default_src_mac_;
     out.default_dst_mac_ = default_dst_mac_;
     out.default_vlan_id_ = default_vlan_id_;
+    other.sync();
     std::vector<DissectedPacket> all = packets_;
     all.insert(all.end(), other.packets_.begin(), other.packets_.end());
     std::stable_sort(all.begin(), all.end(),
                      [](const DissectedPacket& a, const DissectedPacket& b) {
-                         return a.timestamp < b.timestamp;
+                         return a.ts_ns < b.ts_ns;
                      });
     for (const auto& p : all) {
         uint32_t num = static_cast<uint32_t>(out.packets_.size() + 1);
         out.packets_.push_back(dissect_raw_frame(num, p.timestamp, p.raw, p.wire_len, p.linktype));
+        out.packets_.back().ts_ns = p.ts_ns;
     }
     out.analyze();
     return out;
 }
 
 void Capture::save_pcap(const std::string& path) const {
+    sync();
     if (g_dry_run) {
         std::cerr << "[dry-run] would write pcap (" << packets_.size() << " packets) to " << path
                   << "\n";
@@ -3510,25 +4162,32 @@ void Capture::save_pcap(const std::string& path) const {
     if (!ofs) {
         throw std::runtime_error("Failed to open pcap for writing: " + path);
     }
-    write_u32_le(ofs, 0xa1b2c3d4u); // Microsecond pcap magic
+    // Nanosecond magic only when some timestamp has sub-microsecond digits, so ordinary
+    // captures stay in the most widely readable microsecond format.
+    bool nano = false;
+    uint32_t snaplen = 65535;
+    for (const auto& p : packets_) {
+        if (p.ts_ns < 0 || p.ts_ns / 1000000000LL > 0xFFFFFFFFLL) {
+            throw std::runtime_error("Packet timestamp " + std::to_string(p.timestamp) +
+                                     " s cannot be stored in classic PCAP (needs 0..2^32 s)");
+        }
+        if (p.ts_ns % 1000 != 0) nano = true;
+        snaplen = std::max<uint32_t>(snaplen, static_cast<uint32_t>(p.raw.size()));
+    }
+    write_u32_le(ofs, nano ? 0xa1b23c4du : 0xa1b2c3d4u); // ns or us pcap magic
     write_u16_le(ofs, 2);           // Major version 2
     write_u16_le(ofs, 4);           // Minor version 4
     write_u32_le(ofs, 0);           // thiszone
     write_u32_le(ofs, 0);           // sigfigs
-    write_u32_le(ofs, 65535);       // snaplen
+    write_u32_le(ofs, snaplen);     // snaplen (covers the largest stored frame)
     write_u32_le(ofs, linktype);    // network
 
     for (const auto& p : packets_) {
-        double ts = std::max(0.0, p.timestamp);
-        uint32_t sec = static_cast<uint32_t>(std::floor(ts));
-        uint32_t usec =
-            static_cast<uint32_t>(std::llround((ts - std::floor(ts)) * 1000000.0));
-        if (usec >= 1000000u) {
-            sec += 1;
-            usec -= 1000000u;
-        }
+        uint32_t sec = static_cast<uint32_t>(p.ts_ns / 1000000000LL);
+        uint32_t sub = static_cast<uint32_t>(p.ts_ns % 1000000000LL);
+        if (!nano) sub /= 1000u;
         write_u32_le(ofs, sec);
-        write_u32_le(ofs, usec);
+        write_u32_le(ofs, sub);
         write_u32_le(ofs, static_cast<uint32_t>(p.raw.size()));
         write_u32_le(ofs, p.wire_len > 0 ? p.wire_len : static_cast<uint32_t>(p.raw.size()));
         if (!p.raw.empty()) {
@@ -3540,6 +4199,7 @@ void Capture::save_pcap(const std::string& path) const {
 }
 
 void Capture::save_pcapng(const std::string& path) const {
+    sync();
     if (g_dry_run) {
         std::cerr << "[dry-run] would write pcapng (" << packets_.size() << " packets) to " << path
                   << "\n";
@@ -3576,13 +4236,30 @@ void Capture::save_pcapng(const std::string& path) const {
         linktypes.push_back(1);
         lt_to_ifid[1] = 0;
     }
+    bool nano = false;
+    uint32_t snaplen = 65535;
+    for (const auto& p : packets_) {
+        if (p.ts_ns < 0) {
+            throw std::runtime_error("Negative packet timestamp " + std::to_string(p.timestamp) +
+                                     " s cannot be stored in PCAPNG");
+        }
+        if (p.ts_ns % 1000 != 0) nano = true;
+        snaplen = std::max<uint32_t>(snaplen, static_cast<uint32_t>(p.raw.size()));
+    }
     for (uint16_t lt : linktypes) {
+        uint32_t idb_len = nano ? 32u : 20u;
         write_u32_le(ofs, 0x00000001u);
-        write_u32_le(ofs, 20);
+        write_u32_le(ofs, idb_len);
         write_u16_le(ofs, lt);
         write_u16_le(ofs, 0);
-        write_u32_le(ofs, 65535); // SnapLen
-        write_u32_le(ofs, 20);
+        write_u32_le(ofs, snaplen); // SnapLen
+        if (nano) {
+            write_u16_le(ofs, 9); // if_tsresol
+            write_u16_le(ofs, 1);
+            write_u32_le(ofs, 9); // 10^-9 + 3 pad bytes (little-endian: 09 00 00 00)
+            write_u32_le(ofs, 0); // opt_endofopt
+        }
+        write_u32_le(ofs, idb_len);
     }
 
     // 3. Enhanced Packet Blocks (EPB: 0x00000006)
@@ -3593,10 +4270,9 @@ void Capture::save_pcapng(const std::string& path) const {
         uint32_t block_len = 32u + cap_len + pad_len;
         uint32_t if_id = lt_to_ifid[static_cast<uint16_t>(p.linktype)];
 
-        uint64_t ts_us =
-            static_cast<uint64_t>(std::llround(std::max(0.0, p.timestamp) * 1000000.0));
-        uint32_t ts_high = static_cast<uint32_t>((ts_us >> 32) & 0xFFFFFFFFu);
-        uint32_t ts_low = static_cast<uint32_t>(ts_us & 0xFFFFFFFFu);
+        uint64_t units = static_cast<uint64_t>(nano ? p.ts_ns : p.ts_ns / 1000);
+        uint32_t ts_high = static_cast<uint32_t>((units >> 32) & 0xFFFFFFFFu);
+        uint32_t ts_low = static_cast<uint32_t>(units & 0xFFFFFFFFu);
 
         write_u32_le(ofs, 0x00000006u);
         write_u32_le(ofs, block_len);
@@ -3651,6 +4327,7 @@ static std::string json_escape(const std::string& s) {
 }
 
 void Capture::save_packets_csv(const std::string& path) const {
+    sync();
     if (g_dry_run) {
         std::cerr << "[dry-run] would write packets CSV to " << path << "\n";
         return;
@@ -3671,7 +4348,81 @@ void Capture::save_packets_csv(const std::string& path) const {
     finish_output_stream(ofs, path);
 }
 
+static std::vector<std::string> split_field_list(const std::string& fields) {
+    std::vector<std::string> out;
+    std::stringstream ss(fields);
+    std::string f;
+    while (std::getline(ss, f, ',')) {
+        f = to_lower(trim(f));
+        if (f.empty()) continue;
+        if (!known_display_fields().count(f)) {
+            throw std::runtime_error("Unknown field '" + f + "' in field list");
+        }
+        out.push_back(f);
+    }
+    if (out.empty()) throw std::runtime_error("Field list is empty");
+    return out;
+}
+
+void Capture::save_fields_csv(const std::string& display_filter, const std::string& fields,
+                              const std::string& path) const {
+    sync();
+    auto prog = compile_display_filter(display_filter);
+    auto cols = split_field_list(fields);
+    if (g_dry_run) {
+        std::cerr << "[dry-run] would write fields CSV to " << path << "\n";
+        return;
+    }
+    ensure_parent_dir(path);
+    std::ofstream ofs(path);
+    if (!ofs) throw std::runtime_error("Failed to open fields CSV for writing: " + path);
+    for (size_t i = 0; i < cols.size(); ++i) ofs << (i ? "," : "") << cols[i];
+    ofs << "\n";
+    for (const auto& p : packets_) {
+        if (!eval_df(prog.get(), p)) continue;
+        for (size_t i = 0; i < cols.size(); ++i) {
+            ofs << (i ? "," : "") << csv_escape(extract_packet_field(p, cols[i]));
+        }
+        ofs << "\n";
+    }
+    finish_output_stream(ofs, path);
+}
+
+void Capture::save_field_counts_csv(const std::string& display_filter, const std::string& field,
+                                    const std::string& path) const {
+    sync();
+    auto prog = compile_display_filter(display_filter);
+    auto cols = split_field_list(field);
+    if (cols.size() != 1) throw std::runtime_error("save_field_counts_csv takes exactly one field");
+    std::map<std::string, std::pair<int64_t, int64_t>> agg;
+    for (const auto& p : packets_) {
+        if (!eval_df(prog.get(), p)) continue;
+        std::string v = extract_packet_field(p, cols[0]);
+        if (v.empty()) continue;
+        auto& a = agg[v];
+        a.first += 1;
+        a.second += p.wire_len;
+    }
+    std::vector<std::pair<std::string, std::pair<int64_t, int64_t>>> rows(agg.begin(), agg.end());
+    std::stable_sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) {
+        return x.second.first > y.second.first;
+    });
+    if (g_dry_run) {
+        std::cerr << "[dry-run] would write field counts CSV to " << path << "\n";
+        return;
+    }
+    ensure_parent_dir(path);
+    std::ofstream ofs(path);
+    if (!ofs) throw std::runtime_error("Failed to open field counts CSV for writing: " + path);
+    ofs << cols[0] << ",packets,bytes\n";
+    for (const auto& r : rows) {
+        ofs << csv_escape(r.first) << "," << r.second.first << "," << r.second.second << "\n";
+    }
+    finish_output_stream(ofs, path);
+}
+
 void Capture::save_flows_csv(const std::string& path) const {
+    sync();
     if (g_dry_run) {
         std::cerr << "[dry-run] would write flows CSV to " << path << "\n";
         return;
@@ -3698,6 +4449,7 @@ void Capture::save_flows_csv(const std::string& path) const {
 }
 
 void Capture::save_top_talkers_csv(const std::string& path) const {
+    sync();
     if (g_dry_run) {
         std::cerr << "[dry-run] would write top talkers CSV to " << path << "\n";
         return;
@@ -3754,6 +4506,7 @@ void Capture::save_top_talkers_csv(const std::string& path) const {
 }
 
 void Capture::save_protocol_hierarchy_csv(const std::string& path) const {
+    sync();
     if (g_dry_run) {
         std::cerr << "[dry-run] would write protocol hierarchy CSV to " << path << "\n";
         return;
@@ -3791,6 +4544,7 @@ void Capture::save_protocol_hierarchy_csv(const std::string& path) const {
 }
 
 void Capture::save_io_graph_csv(double bucket_sec, const std::string& path) const {
+    sync();
     if (bucket_sec <= 0.0) {
         throw std::runtime_error("bucket_sec must be > 0");
     }
@@ -3862,6 +4616,7 @@ void Capture::save_io_graph_csv(double bucket_sec, const std::string& path) cons
 }
 
 void Capture::save_time_sequence_csv(int64_t stream_id, const std::string& path) const {
+    sync();
     if (g_dry_run) {
         std::cerr << "[dry-run] would write TCP time-sequence CSV to " << path << "\n";
         return;
@@ -3884,6 +4639,7 @@ void Capture::save_time_sequence_csv(int64_t stream_id, const std::string& path)
 }
 
 void Capture::save_json(const std::string& path) const {
+    sync();
     if (g_dry_run) {
         std::cerr << "[dry-run] would write JSON report to " << path << "\n";
         return;
@@ -3919,6 +4675,7 @@ void Capture::save_json(const std::string& path) const {
 }
 
 std::string Capture::summary() const {
+    sync();
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(3);
     oss << "Capture Summary: " << packet_count() << " packets, " << total_bytes()
@@ -3986,9 +4743,9 @@ Capture Shark::open(const std::string& path) const {
                                      "): " + path);
         }
         uint32_t linktype = read_u32_endian(buf.data() + 20, big_endian);
-        if (linktype != 1u && linktype != 101u) {
+        if (!supported_linktype(linktype)) {
             throw std::runtime_error("Unsupported pcap linktype (" + std::to_string(linktype) +
-                                     ", expected 1=Ethernet or 101=Raw IP): " + path);
+                                     ", expected 0=Null, 1=Ethernet, 101=Raw IP or 113=Linux SLL): " + path);
         }
 
         size_t off = 24;
@@ -4021,6 +4778,8 @@ Capture Shark::open(const std::string& path) const {
             double ts = static_cast<double>(ts_sec) +
                         static_cast<double>(ts_sub) / (nanosecond ? 1e9 : 1e6);
             std::vector<uint8_t> raw(buf.begin() + off, buf.begin() + off + incl_len);
+            cap.set_next_ts_ns(static_cast<int64_t>(ts_sec) * 1000000000LL +
+                               static_cast<int64_t>(ts_sub) * (nanosecond ? 1 : 1000));
             cap.add_raw_packet(ts, raw, orig_len, linktype, true);
             off += incl_len;
         }
@@ -4038,6 +4797,7 @@ Capture Shark::open(const std::string& path) const {
         std::vector<uint32_t> iface_linktypes;
         std::vector<uint32_t> iface_snaplens;
         std::vector<double> iface_ts_resol;
+        std::vector<int> iface_ts_code; // raw if_tsresol byte (default 6 = microseconds)
         std::vector<double> iface_ts_offset;
         size_t off = 0;
 
@@ -4059,6 +4819,7 @@ Capture Shark::open(const std::string& path) const {
                 iface_linktypes.clear();
                 iface_snaplens.clear();
                 iface_ts_resol.clear();
+                iface_ts_code.clear();
                 iface_ts_offset.clear();
             } else if (!has_shb) {
                 throw std::runtime_error("Missing initial Section Header Block in pcapng: " + path);
@@ -4101,16 +4862,18 @@ Capture Shark::open(const std::string& path) const {
                     throw std::runtime_error("Invalid IDB length (< 20) in pcapng: " + path);
                 }
                 uint16_t lt = read_u16_endian(buf.data() + off + 8, ng_big_endian);
-                if (lt != 1u && lt != 101u) {
+                if (!supported_linktype(lt)) {
                     throw std::runtime_error("Unsupported pcapng IDB linktype (" +
                                              std::to_string(lt) + ") in: " + path);
                 }
                 uint32_t snap = read_u32_endian(buf.data() + off + 12, ng_big_endian);
-                if (snap == 0 || snap > 67108864u) {
+                if (snap == 0) snap = 0xFFFFFFFFu; // RFC: SnapLen 0 means "no limit"
+                if (snap != 0xFFFFFFFFu && snap > 67108864u) {
                     throw std::runtime_error("Invalid pcapng IDB snaplen (" + std::to_string(snap) +
                                              ") in: " + path);
                 }
                 double resol = 1e-6;
+                int ts_code = 6;
                 double tsoffset = 0.0;
                 // Parse options: if_tsresol (code 9), if_tsoffset (code 14)
                 size_t opt_off = off + 16;
@@ -4144,12 +4907,14 @@ Capture Shark::open(const std::string& path) const {
                                                          path);
                             }
                             resol = std::pow(10.0, -static_cast<int>(exp));
+                            ts_code = r;
                         } else {
                             if (exp > 64) {
                                 throw std::runtime_error("Invalid binary if_tsresol exponent in: " +
                                                          path);
                             }
                             resol = std::pow(2.0, -static_cast<int>(exp));
+                            ts_code = r;
                         }
                     } else if (ocode == 14) {
                         if (olen != 8) {
@@ -4165,6 +4930,7 @@ Capture Shark::open(const std::string& path) const {
                 iface_linktypes.push_back(lt);
                 iface_snaplens.push_back(snap);
                 iface_ts_resol.push_back(resol);
+                iface_ts_code.push_back(ts_code);
                 iface_ts_offset.push_back(tsoffset);
             } else if (btype == 0x00000006u) {
                 // Enhanced Packet Block (EPB)
@@ -4208,7 +4974,12 @@ Capture Shark::open(const std::string& path) const {
                 double resol = iface_ts_resol[if_id];
                 double tsoff = iface_ts_offset[if_id];
                 uint32_t lt = iface_linktypes[if_id];
-                double ts = static_cast<double>(ts64) * resol + tsoff;
+                int64_t ns = pcapng_units_to_ns(ts64, iface_ts_code[if_id]) +
+                             static_cast<int64_t>(tsoff) * 1000000000LL;
+                double ts = static_cast<double>(ns / 1000000000LL) +
+                            static_cast<double>(ns % 1000000000LL) / 1e9;
+                (void)resol;
+                cap.set_next_ts_ns(ns);
                 std::vector<uint8_t> raw(buf.begin() + off + 28,
                                          buf.begin() + off + 28 + cap_len);
                 cap.add_raw_packet(ts, raw, orig_len, lt, true);

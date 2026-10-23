@@ -1,0 +1,145 @@
+# Hand-computed expectations for TCP analysis (fast retransmit, Karn RTT, bytes in flight,
+# out-of-order + overlapping reassembly, window scaling, SACK), DNS latency and answers,
+# QinQ, Linux SLL, nanosecond timestamps and display-filter semantics (in / matches /
+# contains / precedence / CIDR).
+
+p = _dsl_ cli="lmshark";
+
+# 1. Fast retransmission after 3 duplicate ACKs, bytes in flight, Karn's rule for RTT
+let c = shark.capture();
+c.tcp_segment(0.000, "10.0.0.1", 40000, "10.0.0.2", 80, 1000, 0, "SYN", 64240, "");
+c.tcp_segment(0.010, "10.0.0.2", 80, "10.0.0.1", 40000, 5000, 1001, "SYN,ACK", 65535, "");
+c.tcp_segment(0.020, "10.0.0.1", 40000, "10.0.0.2", 80, 1001, 5001, "ACK", 64240, "");
+let body = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
+for (i in range(0, 5)) {
+    c.tcp_segment(0.030 + float(i) * 0.001, "10.0.0.1", 40000, "10.0.0.2", 80, 1001 + i * 100, 5001, "PSH,ACK", 64240, body);
+}
+c.tcp_segment(0.040, "10.0.0.2", 80, "10.0.0.1", 40000, 5001, 1101, "ACK", 65535, "");
+c.tcp_segment(0.042, "10.0.0.2", 80, "10.0.0.1", 40000, 5001, 1101, "ACK", 65535, "");
+c.tcp_segment(0.043, "10.0.0.2", 80, "10.0.0.1", 40000, 5001, 1101, "ACK", 65535, "");
+c.tcp_segment(0.044, "10.0.0.2", 80, "10.0.0.1", 40000, 5001, 1101, "ACK", 65535, "");
+c.tcp_segment(0.045, "10.0.0.1", 40000, "10.0.0.2", 80, 1101, 5001, "PSH,ACK", 64240, body);
+c.tcp_segment(0.055, "10.0.0.2", 80, "10.0.0.1", 40000, 5001, 1501, "ACK", 65535, "");
+assert_eq(c.pkt_field(3, "tcp.analysis.bytes_in_flight"), "100");
+assert_eq(c.pkt_field(7, "tcp.analysis.bytes_in_flight"), "500");
+assert_eq(c.pkt_field(8, "tcp.analysis.ack_rtt"), "10.000");
+assert_eq(c.dup_ack_count(), 3);
+assert_eq(c.pkt_field(12, "tcp.analysis.retransmission"), "true");
+assert_eq(c.pkt_field(12, "tcp.analysis.fast_retransmission"), "true");
+assert_eq(c.pkt_field(12, "tcp.analysis.bytes_in_flight"), "400");
+assert_eq(c.pkt_field(13, "tcp.analysis.ack_rtt"), "21.000");
+assert_eq(c.count("tcp.analysis.fast_retransmission"), 1);
+assert_eq(c.tcp_stream_bytes(0, "client"), 500);
+
+# 2. Out-of-order segment and overlapping retransmission: first copy wins
+let r = shark.capture();
+r.tcp_segment(0.0, "10.0.0.1", 40001, "10.0.0.2", 80, 2000, 0, "SYN", 64240, "");
+r.tcp_segment(0.1, "10.0.0.1", 40001, "10.0.0.2", 80, 2001, 0, "PSH,ACK", 64240, "ABCD");
+r.tcp_segment(0.2, "10.0.0.1", 40001, "10.0.0.2", 80, 2009, 0, "PSH,ACK", 64240, "IJKL");
+r.tcp_segment(0.3, "10.0.0.1", 40001, "10.0.0.2", 80, 2005, 0, "PSH,ACK", 64240, "EFGH");
+r.tcp_segment(0.4, "10.0.0.1", 40001, "10.0.0.2", 80, 2003, 0, "PSH,ACK", 64240, "xxyy");
+assert_eq(r.out_of_order_count(), 1);
+assert_eq(r.retransmission_count(), 1);
+assert_eq(r.tcp_stream_text(0, "client"), "ABCDEFGHIJKL");
+assert_eq(r.tcp_stream_bytes(0, "client"), 12);
+
+# 3. Midstream capture whose first packet is not the lowest sequence number
+let m = shark.capture();
+m.tcp_segment(0.0, "10.0.0.1", 40002, "10.0.0.2", 80, 7005, 1, "PSH,ACK", 64240, "WORLD");
+m.tcp_segment(0.1, "10.0.0.1", 40002, "10.0.0.2", 80, 7000, 1, "PSH,ACK", 64240, "HELLO");
+assert_eq(m.tcp_stream_text(0, "client"), "HELLOWORLD");
+
+# 4. TCP options: MSS, SACK permitted, timestamps, window scale (RFC 7323) and SACK blocks
+let o = shark.capture();
+o.tcp_segment_opts(0.0, "10.0.0.1", 40003, "10.0.0.2", 443, 100, 0, "SYN", 64240, "mss=1460,sack_perm,ts=100/0,nop,wscale=7", "");
+o.tcp_segment_opts(0.01, "10.0.0.2", 443, "10.0.0.1", 40003, 900, 101, "SYN,ACK", 65535, "mss=1400,wscale=8", "");
+o.tcp_segment(0.02, "10.0.0.1", 40003, "10.0.0.2", 443, 101, 901, "ACK", 100, "");
+o.tcp_segment_opts(0.03, "10.0.0.2", 443, "10.0.0.1", 40003, 901, 101, "ACK", 10, "nop,nop,sack=3001-3101;4001-4201", "");
+assert_eq(o.pkt_field(0, "tcp.options.mss_val"), "1460");
+assert_eq(o.pkt_field(0, "tcp.options.wscale.multiplier"), "128");
+assert_eq(o.pkt_field(0, "tcp.options.sack_perm"), "1");
+assert_eq(o.pkt_field(0, "tcp.options.timestamp.tsval"), "100");
+assert_eq(o.pkt_field(0, "tcp.hdr_len"), "40");
+assert_eq(o.pkt_field(1, "tcp.options.wscale.shift"), "8");
+assert_eq(o.pkt_field(2, "tcp.window_size_value"), "100");
+assert_eq(o.pkt_field(2, "tcp.window_size"), "12800");
+assert_eq(o.pkt_field(3, "tcp.window_size"), "2560");
+assert_eq(o.pkt_field(3, "tcp.options.sack"), "3001-3101;4001-4201");
+assert_eq(o.pkt_field(3, "tcp.checksum_ok"), "true");
+assert_eq(o.count("tcp.options.mss_val >= 1400"), 2);
+
+# 5. DNS latency (dns.time) and every answer record decoded
+let d = shark.capture();
+d.dns_query(1.000, "10.0.0.1", 5353, "8.8.8.8", 77, "www.example.com", "A");
+d.dns_query(1.001, "10.0.0.1", 5354, "8.8.8.8", 78, "nx.example.com", "A");
+d.dns_response(1.0234, "8.8.8.8", "10.0.0.1", 5353, 77, "www.example.com", "A", "93.184.216.34", 0);
+d.dns_response(1.0410, "8.8.8.8", "10.0.0.1", 5354, 78, "nx.example.com", "A", "", 3);
+assert_eq(d.pkt_field(2, "dns.time"), "23.400");
+assert_eq(d.pkt_field(3, "dns.time"), "40.000");
+assert_eq(d.pkt_field(0, "dns.time"), "");
+assert_eq(d.pkt_field(2, "dns.a"), "93.184.216.34");
+assert_eq(d.count("dns.time > 30"), 1);
+assert_eq(d.count("dns.flags.rcode == 3"), 1);
+
+# 6. QinQ (802.1ad S-tag + 802.1Q C-tag) survives a pcapng round trip
+let q = shark.capture();
+q.set_qinq(100, 20);
+q.udp_datagram(0.0, "10.1.0.1", 1000, "10.1.0.2", 2000, "q");
+q.clear_vlan();
+q.udp_datagram(0.1, "10.1.0.1", 1000, "10.1.0.2", 2000, "u");
+q.save_pcapng("build/tests/qinq.pcapng");
+let q2 = shark.open("build/tests/qinq.pcapng");
+assert_eq(q2.pkt_vlan(0), 100);
+assert_eq(q2.pkt_field(0, "vlan.inner_id"), "20");
+assert_eq(q2.pkt_field(0, "vlan.count"), "2");
+assert_eq(q2.count("vlan.id == 20"), 1);
+assert_eq(q2.count("vlan"), 1);
+assert_eq(q2.pkt_proto(0), "UDP");
+
+# 7. Linux cooked capture (LINKTYPE_LINUX_SLL = 113)
+let s = shark.capture();
+s.raw_frame(0.0, "00000001000602000000000100000800" + "4500001c00010000400166de0a0000010a0000020800f7fd00010001", 113);
+assert_eq(s.pkt_proto(0), "ICMP");
+assert_eq(s.pkt_field(0, "ip.checksum_ok"), "true");
+s.save_pcap("build/tests/sll.pcap");
+assert_eq(shark.open("build/tests/sll.pcap").pkt_linktype(0), 113);
+
+# 8. Nanosecond timestamps survive pcap and pcapng round trips exactly
+let n = shark.capture();
+n.udp_datagram(1700000000.000000123, "10.0.0.1", 1, "10.0.0.2", 2, "ns");
+n.udp_datagram(1700000000.5, "10.0.0.1", 1, "10.0.0.2", 2, "us");
+n.save_pcap("build/tests/ns.pcap");
+n.save_pcapng("build/tests/ns.pcapng");
+assert_eq(shark.open("build/tests/ns.pcap").pkt_field(1, "frame.time_epoch_ns"), "1700000000500000000");
+let n1 = shark.open("build/tests/ns.pcap").pkt_field(0, "frame.time_epoch_ns");
+let n2 = shark.open("build/tests/ns.pcapng").pkt_field(0, "frame.time_epoch_ns");
+assert_eq(n1, n2);
+let u = shark.capture();
+u.udp_datagram(0.25, "10.0.0.1", 1, "10.0.0.2", 2, "us");
+u.save_pcapng("build/tests/us.pcapng");
+assert_eq(shark.open("build/tests/us.pcapng").pkt_field(0, "frame.time_epoch_ns"), "250000000");
+
+# 9. Display-filter semantics
+let f = shark.capture();
+f.tcp_segment(0.0, "10.0.0.1", 40000, "10.0.0.2", 443, 1, 0, "SYN", 100, "");
+f.tcp_segment(0.1, "10.0.0.1", 40001, "192.168.1.9", 8080, 1, 0, "SYN", 100, "");
+f.udp_datagram(0.2, "10.0.0.1", 5000, "10.0.0.3", 53, "x");
+f.http_request(0.3, "10.0.0.1", 40002, "10.0.0.2", 80, 1, 1, "GET", "/Admin/Login", "Shop.example", "");
+assert_eq(f.count("tcp.port in {443 8000..8100}"), 2);
+assert_eq(f.count("tcp.port in {80, 443}"), 2);
+assert_eq(f.count("ip.addr == 192.168.0.0/16"), 1);
+assert_eq(f.count("ip.dst != 10.0.0.0/8"), 1);
+assert_eq(f.count("http.uri contains \"Admin\""), 1);
+assert_eq(f.count("http.uri contains \"admin\""), 0);
+assert_eq(f.count("http.uri matches \"^/admin\""), 0);
+assert_eq(f.count("http.uri matches \"(?i)^/admin\""), 1);
+assert_eq(f.count("http.host ~ \"example$\""), 1);
+assert_eq(f.count("udp || tcp && tcp.dstport == 443"), 2);
+assert_eq(f.count("(udp || tcp) && tcp.dstport == 443"), 1);
+assert_eq(f.count("!tcp"), 1);
+assert_eq(f.count("tcp.dstport > 1000 and not ip.dst == 10.0.0.2"), 1);
+assert_eq(f.count(""), 4);
+f.save_fields_csv("tcp", "frame.number,ip.dst,tcp.dstport,http.uri", "build/tests/fields.csv");
+f.save_field_counts_csv("", "ip.dst", "build/tests/field_counts.csv");
+end _dsl_
+savedsl(p, "build/tests/protocol_correctness.dslb");

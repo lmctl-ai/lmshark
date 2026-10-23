@@ -39,6 +39,15 @@
             "returns": "void"
           }
         ],
+        "set_qinq": [
+          {
+            "params": [
+              "int",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
         "clear_vlan": [
           {
             "params": [],
@@ -203,6 +212,24 @@
             "params": [
               "float",
               "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "tcp_segment_opts": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int",
+              "string",
+              "int",
+              "int",
+              "int",
+              "string",
+              "int",
               "string",
               "string"
             ],
@@ -708,6 +735,34 @@
               "int"
             ],
             "returns": "float"
+          }
+        ],
+        "count": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "int"
+          }
+        ],
+        "save_fields_csv": [
+          {
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "save_field_counts_csv": [
+          {
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
           }
         ],
         "filter": [

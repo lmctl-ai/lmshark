@@ -12,6 +12,7 @@ bool dry_run_mode();
 struct DissectedPacket {
     uint32_t number = 0;
     double timestamp = 0.0;
+    int64_t ts_ns = 0; // exact capture timestamp in integer nanoseconds (authoritative for I/O)
     uint32_t wire_len = 0;
     uint32_t cap_len = 0;
     uint32_t linktype = 1; // 1 = Ethernet, 101 = Raw IP
@@ -23,8 +24,9 @@ struct DissectedPacket {
     std::string eth_dst;
     uint16_t eth_type = 0;
     bool has_vlan = false;
-    uint16_t vlan_id = 0;
+    uint16_t vlan_id = 0;        // outermost tag (S-tag for QinQ)
     uint8_t vlan_prio = 0;
+    std::vector<uint16_t> vlan_ids; // every stacked tag, outermost first (802.1Q / 802.1ad QinQ)
 
     // Layer 2.5: ARP
     bool has_arp = false;
@@ -77,6 +79,15 @@ struct DissectedPacket {
     uint32_t tcp_payload_offset = 0;
     uint32_t tcp_payload_len = 0;
     bool tcp_checksum_ok = true;
+    // TCP options (RFC 9293 / 7323 / 2018)
+    int32_t tcp_opt_mss = -1;
+    int32_t tcp_opt_wscale = -1;
+    bool tcp_opt_sack_perm = false;
+    std::string tcp_opt_sack;      // "le-re;le-re" absolute SACK edges
+    bool tcp_opt_has_ts = false;
+    uint32_t tcp_opt_tsval = 0;
+    uint32_t tcp_opt_tsecr = 0;
+    int64_t tcp_win_scaled = -1;   // window << negotiated shift (-1 when not negotiated)
 
     // TCP conversation & sequence analysis (RFC 9293 / RFC 1982 modular sequence arithmetic)
     int32_t tcp_stream = -1;
@@ -88,7 +99,9 @@ struct DissectedPacket {
     bool tcp_out_of_order = false;
     bool tcp_dup_ack = false;
     bool tcp_zero_window = false;
+    bool tcp_fast_retransmission = false;
     double tcp_rtt_ms = 0.0;
+    int64_t tcp_bytes_in_flight = -1; // unacked bytes after this data segment (-1 if not data)
 
     // Layer 4: UDP (RFC 768)
     bool has_udp = false;
@@ -109,6 +122,9 @@ struct DissectedPacket {
     std::string dns_qtype;
     std::string dns_answer;
     uint16_t dns_ancount = 0;
+    std::vector<std::string> dns_answers;      // every decoded answer RR (rdata text)
+    std::vector<std::string> dns_answer_types; // RR type names, parallel to dns_answers
+    double dns_time_ms = -1.0;                 // response latency vs matching query (-1 if none)
 
     // Layer 7: HTTP/1.x
     bool has_http = false;
@@ -185,7 +201,10 @@ public:
     /// Enable an IEEE 802.1Q VLAN tag (1..4094) for subsequently built packets.
     void set_vlan(int64_t vlan_id);
 
-    /// Clear the IEEE 802.1Q VLAN tag for subsequently built packets.
+    /// Enable stacked 802.1ad QinQ tagging (outer S-tag TPID 0x88a8, inner C-tag TPID 0x8100; ids 1..4094) for subsequently built packets.
+    void set_qinq(int64_t outer_vlan_id, int64_t inner_vlan_id);
+
+    /// Clear the IEEE 802.1Q / QinQ VLAN tags for subsequently built packets.
     void clear_vlan();
 
     /// Append a raw frame from hexadecimal bytes with the given linktype (1 = Ethernet, 101 = Raw IP).
@@ -245,6 +264,12 @@ public:
     void tcp_segment(double ts, const std::string& src_ip, int64_t src_port,
                      const std::string& dst_ip, int64_t dst_port, int64_t seq, int64_t ack,
                      const std::string& flags, int64_t window, const std::string& payload);
+
+    /// Emit an IPv4 TCP segment carrying TCP options given as a comma list: "mss=1460", "wscale=7", "sack_perm", "sack=L-R;L-R" (absolute seq edges), "ts=TSVAL/TSECR", "nop".
+    void tcp_segment_opts(double ts, const std::string& src_ip, int64_t src_port,
+                          const std::string& dst_ip, int64_t dst_port, int64_t seq, int64_t ack,
+                          const std::string& flags, int64_t window, const std::string& options,
+                          const std::string& payload);
 
     /// Emit a raw IPv6 TCP segment with explicit sequence/ack numbers, flags, window size, and payload.
     void tcp6_segment(double ts, const std::string& src_ip6, int64_t src_port,
@@ -427,6 +452,17 @@ public:
     /// Filter packets using a Wireshark-style display filter expression (e.g. "tcp.port == 443 && tls.sni == \"api.example.com\"" or "dns || http.status >= 400") and return a new Capture.
     Capture filter(const std::string& expr) const;
 
+    /// Export one CSV row per packet matching display_filter ("" = all) with the given comma-separated field columns (like tshark -T fields -e); absent fields are empty cells.
+    void save_fields_csv(const std::string& display_filter, const std::string& fields,
+                         const std::string& path) const;
+
+    /// Export a value,packets,bytes histogram of one field over packets matching display_filter, sorted by packets descending (like a Wireshark statistics group-by).
+    void save_field_counts_csv(const std::string& display_filter, const std::string& field,
+                               const std::string& path) const;
+
+    /// Return the number of packets matching a display filter (no copy).
+    int64_t count(const std::string& display_filter) const;
+
     /// Filter packets using a BPF-style capture filter expression (e.g. "tcp and port 80 and host 10.0.0.1" or "udp portrange 1000-2000") and return a new Capture.
     Capture bpf(const std::string& expr) const;
 
@@ -470,12 +506,26 @@ public:
     void add_raw_packet(double ts, const std::vector<uint8_t>& raw, uint32_t wire_len = 0,
                         uint32_t linktype = 1, bool defer_analyze = false);
     void analyze();
-    const std::vector<DissectedPacket>& packets() const { return packets_; }
+    /// Give the next add_raw_packet an exact integer-nanosecond timestamp (file readers).
+    void set_next_ts_ns(int64_t ns) { ts_ns_override_ = ns; ts_ns_override_set_ = true; }
+    const std::vector<DissectedPacket>& packets() const { sync(); return packets_; }
 
 private:
+    // Builders append packets without re-running the O(N) stream analysis; every query
+    // calls sync() first, so a capture of N built packets is analysed once, not N times.
+    void sync() const {
+        if (dirty_) {
+            dirty_ = false;
+            const_cast<Capture*>(this)->analyze();
+        }
+    }
+    mutable bool dirty_ = false;
+    int64_t ts_ns_override_ = 0;
+    bool ts_ns_override_set_ = false;
+
     std::string default_src_mac_ = "02:00:00:00:00:01";
     std::string default_dst_mac_ = "02:00:00:00:00:02";
-    uint16_t default_vlan_id_ = 0;
+    uint32_t default_vlan_id_ = 0; // low 12 bits: C-tag; bits 16..27: QinQ S-tag
     std::vector<DissectedPacket> packets_;
 };
 

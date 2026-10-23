@@ -70,9 +70,14 @@ n=0
 for src in tests/*.lms; do
   name="$(basename "$src" .lms)"
   "$LMSCRIPT" "$src" >"$WORK/$name.log" 2>&1 || { cat "$WORK/$name.log" >&2; fail "$name test"; }
+  # lmscript only compiles; execute the saved program so every assertion really runs.
+  [ -s "build/tests/$name.dslb" ] || fail "$name: tests/$name.lms must savedsl(p, \"build/tests/$name.dslb\")"
+  "$HOST" --dsl "build/tests/$name.dslb" >"$WORK/$name.run" 2>&1 || { cat "$WORK/$name.run" >&2; fail "$name test run"; }
   n=$((n+1))
 done
-ok "$n DSL test suites compile and pass all dissector, filter, TCP stream, and pcap/pcapng assertions"
+printf 'frame.number,ip.dst,tcp.dstport,http.uri\n1,10.0.0.2,443,\n2,192.168.1.9,8080,\n4,10.0.0.2,80,/Admin/Login\n' | cmp -s - build/tests/fields.csv || fail "save_fields_csv output differs: $(cat build/tests/fields.csv)"
+printf 'ip.dst,packets,bytes\n10.0.0.2,2,182\n10.0.0.3,1,43\n192.168.1.9,1,54\n' | cmp -s - build/tests/field_counts.csv || fail "save_field_counts_csv output differs"
+ok "$n DSL test suites compile, run and pass all dissector, filter, TCP stream, and pcap/pcapng assertions"
 
 # Gallery: every image the README references exists and is a valid PNG/GIF; every linked example exists.
 img_ok() {
@@ -167,14 +172,25 @@ expect_error assertint 'assert_eq(1, 2);' "assert_eq(int)"
 expect_error assertstr 'assert_eq("TCP", "UDP");' "assert_eq(string)"
 expect_error assertclose 'assert_close(1.0, 2.0, 0.1);' "assert_close"
 expect_error badout "let c = shark.capture(); c.icmp_echo_request(0.0, \"10.0.0.1\", \"8.8.8.8\", 1, 1, 64, 16); c.save_pcap(\"$WORK\");" "Failed to open pcap for writing"
+expect_error unkfield 'let c = shark.capture(); let n = c.count("tcp.prot == 80");' "Unknown field or protocol"
+expect_error unkpktfield 'let c = shark.capture(); c.udp_datagram(0.0, "10.0.0.1", 1, "10.0.0.2", 2, "x"); let v = c.pkt_field(0, "udp.portt");' "Unknown field"
+expect_error lonelyamp 'let c = shark.capture(); let n = c.count("udp & ip");' "Unexpected character"
+expect_error badregex 'let c = shark.capture(); let n = c.count("dns.qname matches \"(\"");' "Invalid regular expression"
+expect_error unterminated 'let c = shark.capture(); let n = c.count("http.host == \"abc");' "Unterminated string"
+expect_error badset 'let c = shark.capture(); let n = c.count("tcp.port in {80 443");' "close set"
+expect_error badtcpopt 'let c = shark.capture(); c.tcp_segment_opts(0.0, "10.0.0.1", 1, "10.0.0.2", 2, 1, 0, "SYN", 100, "mss=99999", "");' "out of range"
+expect_error badtcpport 'let c = shark.capture(); c.tcp_segment_opts(0.0, "10.0.0.1", 70000, "10.0.0.2", 2, 1, 0, "SYN", 100, "", "");' "port out of range"
+expect_error badqinq 'let c = shark.capture(); c.set_qinq(0, 10);' "QinQ"
+expect_error badfields 'let c = shark.capture(); c.save_fields_csv("", "ip.src,nope.field", "x.csv");' "Unknown field"
+expect_error negts "let c = shark.capture(); c.udp_datagram(-1.0, \"10.0.0.1\", 1, \"10.0.0.2\", 2, \"x\"); c.save_pcap(\"$WORK/neg.pcap\");" "cannot be stored"
 if [ "$UNAME_S" = Linux ] && [ -w /dev/full ]; then
   expect_error devfull_pcap 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_pcap("/dev/full");' "Error writing"
   expect_error devfull_pcapng 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_pcapng("/dev/full");' "Error writing"
   expect_error devfull_csv 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_packets_csv("/dev/full");' "Error writing"
   expect_error devfull_json 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_json("/dev/full");' "Error writing"
-  ok "errors (including malformed headers, mixed linktypes, overflow EPB, and /dev/full writes) stop with exit 3 and stderr messages (26 cases)"
+  ok "errors (including malformed headers, mixed linktypes, overflow EPB, and /dev/full writes) stop with exit 3 and stderr messages (37 cases)"
 else
-  ok "errors (including malformed headers, mixed linktypes, overflow EPB, and unwritable output paths) stop with exit 3 and stderr messages (22 cases)"
+  ok "errors (including malformed headers, mixed linktypes, overflow EPB, and unwritable output paths) stop with exit 3 and stderr messages (33 cases)"
 fi
 
 # Memory budget: a runaway loop duplicating multi-megabyte captures stops with a run error (exit 3)
