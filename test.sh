@@ -166,14 +166,15 @@ expect_error badbucket 'let c = shark.capture(); c.save_io_graph_csv(0.0, "$WORK
 expect_error assertint 'assert_eq(1, 2);' "assert_eq(int)"
 expect_error assertstr 'assert_eq("TCP", "UDP");' "assert_eq(string)"
 expect_error assertclose 'assert_close(1.0, 2.0, 0.1);' "assert_close"
-if [ -w /dev/full ]; then
+if [ "$UNAME_S" = Linux ] && [ -w /dev/full ]; then
   expect_error devfull_pcap 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_pcap("/dev/full");' "Error writing"
   expect_error devfull_pcapng 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_pcapng("/dev/full");' "Error writing"
   expect_error devfull_csv 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_packets_csv("/dev/full");' "Error writing"
   expect_error devfull_json 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_json("/dev/full");' "Error writing"
   ok "errors (including malformed headers, mixed linktypes, overflow EPB, and /dev/full writes) stop with exit 3 and stderr messages (25 cases)"
 else
-  ok "errors (including malformed headers, mixed linktypes, and overflow EPB) stop with exit 3 and stderr messages (21 cases)"
+  expect_error badout 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_pcap("/nonexistent_dir_xyz/out.pcap");' "Cannot open"
+  ok "errors (including malformed headers, mixed linktypes, overflow EPB, and unwritable output paths) stop with exit 3 and stderr messages (22 cases)"
 fi
 
 # Memory budget: a runaway loop duplicating multi-megabyte captures stops with a run error (exit 3)
