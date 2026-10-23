@@ -84,12 +84,12 @@ plot.cmd("plot 'build/examples/tcp_stevens.csv' every ::1 using (strcol(2) eq 'c
 plot.cmd("set size 1.0, 0.38");
 plot.cmd("set origin 0.0, 0.0");
 plot.cmd("set xlabel 'Capture Time (s)'");
-plot.cmd("set ylabel 'Advertised Window (Bytes)'");
-plot.cmd("set y2label 'Measured ACK RTT (ms)'");
+plot.cmd("set ylabel 'Receive window (bytes)' tc rgb '#8957e5'");
+plot.cmd("set y2label 'ACK RTT (ms)' tc rgb '#b07d12'");
 plot.cmd("set ytics nomirror");
 plot.cmd("set y2tics 0, 10, 50");
 plot.cmd("set y2range [0:50]");
-plot.cmd("set key bottom right box opaque");
+plot.cmd("unset key");
 plot.cmd("plot 'build/examples/tcp_stevens.csv' every ::1 using 1:6 axes x1y1 with lines lw 2.2 lc rgb '#8957e5' title 'Advertised Receive Window (Bytes)', '' every ::1 using ($9 > 0 ? $1 : 1/0):9 axes x1y2 with impulses lw 3.5 lc rgb '#d29922' title 'Sampled ACK RTT (ms)'");
 plot.cmd("unset multiplot");
 plot.close();

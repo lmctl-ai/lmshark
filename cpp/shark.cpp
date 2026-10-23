@@ -2071,6 +2071,17 @@ void Capture::http_response(double ts, const std::string& src_ip, int64_t src_po
     tcp_segment(ts, src_ip, src_port, dst_ip, dst_port, seq, ack, "PSH,ACK", 65535, resp.str());
 }
 
+// "1.0".."1.3" (optionally prefixed "TLS ") -> wire version code.
+static uint16_t tls_version_code(const std::string& v) {
+    std::string t = trim(v);
+    if (t.size() > 4 && to_upper(t.substr(0, 4)) == "TLS ") t = trim(t.substr(4));
+    if (t == "1.0") return 0x0301;
+    if (t == "1.1") return 0x0302;
+    if (t == "1.2") return 0x0303;
+    if (t == "1.3") return 0x0304;
+    throw std::runtime_error("Unsupported TLS version '" + v + "' (expected 1.0, 1.1, 1.2 or 1.3)");
+}
+
 void Capture::tls_client_hello(double ts, const std::string& src_ip, int64_t src_port,
                                const std::string& dst_ip, int64_t dst_port, int64_t seq,
                                int64_t ack, const std::string& sni,
@@ -2085,12 +2096,15 @@ void Capture::tls_client_hello(double ts, const std::string& src_ip, int64_t src
         push_u16_be(exts, nlen);
         exts.insert(exts.end(), sni.begin(), sni.end());
     }
-    // supported_versions (0x002b)
-    bool is_13 = (tls_version.find("1.3") != std::string::npos);
-    push_u16_be(exts, 0x002b);
-    push_u16_be(exts, 3);
-    exts.push_back(2);
-    push_u16_be(exts, is_13 ? 0x0304 : 0x0303);
+    // supported_versions (0x002b) is a TLS 1.3-era extension; 1.0/1.1 clients never send it
+    uint16_t ver = tls_version_code(tls_version);
+    bool is_13 = ver == 0x0304;
+    if (ver >= 0x0303) {
+        push_u16_be(exts, 0x002b);
+        push_u16_be(exts, 3);
+        exts.push_back(2);
+        push_u16_be(exts, is_13 ? 0x0304 : 0x0303);
+    }
 
     if (!alpn.empty()) {
         uint8_t plen = static_cast<uint8_t>(std::min<size_t>(255, alpn.size()));
@@ -2102,12 +2116,17 @@ void Capture::tls_client_hello(double ts, const std::string& src_ip, int64_t src
     }
 
     std::vector<uint8_t> ch;
-    push_u16_be(ch, 0x0303); // Legacy ClientHello version TLS 1.2
+    push_u16_be(ch, is_13 ? 0x0303 : ver); // legacy_version (capped at TLS 1.2 by RFC 8446)
     for (int i = 0; i < 32; ++i) ch.push_back(static_cast<uint8_t>(0x10 + i)); // Random
     ch.push_back(0);                                                           // Session ID len = 0
     push_u16_be(ch, 4);                                                        // Cipher suites len
-    push_u16_be(ch, 0x1301); // TLS_AES_128_GCM_SHA256
-    push_u16_be(ch, 0xc02f); // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    if (ver >= 0x0303) {
+        push_u16_be(ch, 0x1301); // TLS_AES_128_GCM_SHA256
+        push_u16_be(ch, 0xc02f); // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    } else {
+        push_u16_be(ch, 0x002f); // TLS_RSA_WITH_AES_128_CBC_SHA
+        push_u16_be(ch, 0x000a); // TLS_RSA_WITH_3DES_EDE_CBC_SHA
+    }
     ch.push_back(1);         // Compression methods len
     ch.push_back(0);         // null compression
     push_u16_be(ch, static_cast<uint16_t>(exts.size()));
@@ -2131,10 +2150,13 @@ void Capture::tls_server_hello(double ts, const std::string& src_ip, int64_t src
                                int64_t ack, const std::string& tls_version,
                                const std::string& alpn, int64_t cipher_suite) {
     std::vector<uint8_t> exts;
-    bool is_13 = (tls_version.find("1.3") != std::string::npos);
-    push_u16_be(exts, 0x002b);
-    push_u16_be(exts, 2);
-    push_u16_be(exts, is_13 ? 0x0304 : 0x0303);
+    uint16_t ver = tls_version_code(tls_version);
+    bool is_13 = ver == 0x0304;
+    if (ver >= 0x0303) {
+        push_u16_be(exts, 0x002b);
+        push_u16_be(exts, 2);
+        push_u16_be(exts, is_13 ? 0x0304 : 0x0303);
+    }
 
     if (!alpn.empty()) {
         uint8_t plen = static_cast<uint8_t>(std::min<size_t>(255, alpn.size()));
@@ -2146,7 +2168,7 @@ void Capture::tls_server_hello(double ts, const std::string& src_ip, int64_t src
     }
 
     std::vector<uint8_t> sh;
-    push_u16_be(sh, 0x0303);
+    push_u16_be(sh, is_13 ? 0x0303 : ver);
     for (int i = 0; i < 32; ++i) sh.push_back(static_cast<uint8_t>(0x40 + i));
     sh.push_back(0); // Session ID len = 0
     push_u16_be(sh, static_cast<uint16_t>(cipher_suite & 0xFFFF));
@@ -2156,7 +2178,7 @@ void Capture::tls_server_hello(double ts, const std::string& src_ip, int64_t src
 
     std::vector<uint8_t> rec;
     rec.push_back(22); // Handshake
-    push_u16_be(rec, 0x0303);
+    push_u16_be(rec, is_13 ? 0x0303 : ver);
     push_u16_be(rec, static_cast<uint16_t>(4 + sh.size()));
     rec.push_back(2); // ServerHello
     rec.push_back(0);
@@ -2586,6 +2608,7 @@ void Capture::analyze() {
         p.tcp_saw_syn = false;
         p.tcp_fast_retransmission = false;
         p.tcp_bytes_in_flight = -1;
+        p.tcp_acked_bytes = 0;
         p.tcp_win_scaled = -1;
         // Drop analysis prefixes from an earlier analyze() run; they are recomputed below.
         while (p.info.compare(0, 5, "[TCP ") == 0 && p.info.find("] ") != std::string::npos) {
@@ -2626,6 +2649,10 @@ void Capture::analyze() {
         }
         if (p.flag_ack() && other_dir.has_isn) {
             uint64_t ra = static_cast<uint64_t>(rel_ack_u32);
+            uint64_t before = other_dir.has_acked ? other_dir.acked_upto : 0;
+            if (ra > before && ra - before < (1ull << 31)) {
+                p.tcp_acked_bytes = static_cast<int64_t>(ra - before);
+            }
             if (!other_dir.has_acked || ra > other_dir.acked_upto) other_dir.acked_upto = ra;
             other_dir.has_acked = true;
         }
@@ -3035,8 +3062,15 @@ int64_t Capture::pkt_vlan(int64_t idx) const {
 std::string Capture::pkt_info(int64_t idx) const {
     sync(); return get_pkt_checked(packets_, idx).info; }
 
+// Wireshark spells two TCP flag fields differently from our short names; accept both.
+static std::string canonical_field(std::string f) {
+    if (f == "tcp.flags.reset") return "tcp.flags.rst";
+    if (f == "tcp.flags.push") return "tcp.flags.psh";
+    return f;
+}
+
 static std::string extract_packet_field(const DissectedPacket& p, const std::string& field_raw) {
-    std::string f = to_lower(trim(field_raw));
+    std::string f = canonical_field(to_lower(trim(field_raw)));
     if (f == "frame.number" || f == "no") return std::to_string(p.number);
     if (f == "frame.len" || f == "length") return std::to_string(p.wire_len);
     if (f == "frame.cap_len") return std::to_string(p.cap_len);
@@ -3126,6 +3160,8 @@ static std::string extract_packet_field(const DissectedPacket& p, const std::str
     if (f == "tcp.analysis.bytes_in_flight")
         return (p.has_tcp && p.tcp_bytes_in_flight >= 0) ? std::to_string(p.tcp_bytes_in_flight)
                                                          : "";
+    if (f == "tcp.analysis.acked_bytes")
+        return p.has_tcp ? std::to_string(p.tcp_acked_bytes) : "";
     if (f == "tcp.analysis.fast_retransmission")
         return p.has_tcp ? (p.tcp_fast_retransmission ? "true" : "false") : "";
     if (f == "tcp.len") return p.has_tcp ? std::to_string(p.tcp_payload_len) : "";
@@ -3242,12 +3278,12 @@ static const std::set<std::string>& known_display_fields() {
     "ipv6.frag_id", "ipv6.frag_offset", "ipv6.fragmented", "ipv6.hlim", "ipv6.reassembled",
     "ipv6.reassembled_len", "ipv6.src", "length", "no", "ntp", "ntp.mode", "ntp.ref_id",
     "ntp.stratum", "ntp.version", "protocol", "quic", "quic.dcid", "quic.scid", "quic.type",
-    "quic.version", "raw", "ssl", "tcp", "tcp.ack", "tcp.analysis.ack_rtt",
+    "quic.version", "raw", "ssl", "tcp", "tcp.ack", "tcp.analysis.ack_rtt", "tcp.analysis.acked_bytes",
     "tcp.analysis.bytes_in_flight", "tcp.analysis.duplicate_ack",
     "tcp.analysis.fast_retransmission", "tcp.analysis.out_of_order",
     "tcp.analysis.retransmission", "tcp.analysis.zero_window", "tcp.checksum_ok", "tcp.dstport",
     "tcp.flags", "tcp.flags.ack", "tcp.flags.cwr", "tcp.flags.ece", "tcp.flags.fin",
-    "tcp.flags.ns", "tcp.flags.psh", "tcp.flags.rst", "tcp.flags.syn", "tcp.flags.urg",
+    "tcp.flags.ns", "tcp.flags.psh", "tcp.flags.push", "tcp.flags.reset", "tcp.flags.rst", "tcp.flags.syn", "tcp.flags.urg",
     "tcp.hdr_len", "tcp.len", "tcp.options.mss_val", "tcp.options.sack",
     "tcp.options.sack_perm", "tcp.options.timestamp.tsecr", "tcp.options.timestamp.tsval",
     "tcp.options.wscale.multiplier", "tcp.options.wscale.shift", "tcp.port", "tcp.rel_ack",
@@ -3562,7 +3598,7 @@ bool compare_single_value(const std::string& lhs, const std::string& op, const s
 
 bool eval_display_atom(const DissectedPacket& p, const std::string& field_raw,
                        const std::string& op, const std::string& rhs) {
-    std::string f = to_lower(trim(field_raw));
+    std::string f = canonical_field(to_lower(trim(field_raw)));
     if (op.empty()) {
         // Bare protocol or boolean flag
         if (f == "tcp.flags.fin") return p.has_tcp && p.flag_fin();
@@ -3626,7 +3662,9 @@ bool eval_display_atom(const DissectedPacket& p, const std::string& field_raw,
     } else if (f == "ip.checksum_ok" || f == "tcp.checksum_ok" || f == "udp.checksum_ok" ||
                f == "icmp.checksum_ok" || f == "icmpv6.checksum_ok" || f == "ip.fragmented" ||
                f == "ipv6.fragmented" || f == "ip.reassembled" || f == "ipv6.reassembled" ||
-               f.find("tcp.analysis.") == 0) {
+               f == "tcp.analysis.retransmission" || f == "tcp.analysis.out_of_order" ||
+               f == "tcp.analysis.duplicate_ack" || f == "tcp.analysis.zero_window" ||
+               f == "tcp.analysis.fast_retransmission") {
         if (rhs == "1" || to_lower(rhs) == "true") norm_rhs = "true";
         if (rhs == "0" || to_lower(rhs) == "false") norm_rhs = "false";
     }
@@ -4333,7 +4371,7 @@ void Capture::save_packets_csv(const std::string& path) const {
         return;
     }
     ensure_parent_dir(path);
-    std::ofstream ofs(path);
+    std::ofstream ofs(path, std::ios::binary); // LF line endings on every platform
     if (!ofs) throw std::runtime_error("Cannot write CSV: " + path);
     ofs << "no,time,src,srcport,dst,dstport,protocol,length,vlan,tcp_stream,retrans,rtt_ms,info\n";
     ofs << std::fixed << std::setprecision(6);
@@ -4374,7 +4412,7 @@ void Capture::save_fields_csv(const std::string& display_filter, const std::stri
         return;
     }
     ensure_parent_dir(path);
-    std::ofstream ofs(path);
+    std::ofstream ofs(path, std::ios::binary); // LF line endings on every platform
     if (!ofs) throw std::runtime_error("Failed to open fields CSV for writing: " + path);
     for (size_t i = 0; i < cols.size(); ++i) ofs << (i ? "," : "") << cols[i];
     ofs << "\n";
@@ -4412,7 +4450,7 @@ void Capture::save_field_counts_csv(const std::string& display_filter, const std
         return;
     }
     ensure_parent_dir(path);
-    std::ofstream ofs(path);
+    std::ofstream ofs(path, std::ios::binary); // LF line endings on every platform
     if (!ofs) throw std::runtime_error("Failed to open field counts CSV for writing: " + path);
     ofs << cols[0] << ",packets,bytes\n";
     for (const auto& r : rows) {
@@ -4428,7 +4466,7 @@ void Capture::save_flows_csv(const std::string& path) const {
         return;
     }
     ensure_parent_dir(path);
-    std::ofstream ofs(path);
+    std::ofstream ofs(path, std::ios::binary); // LF line endings on every platform
     if (!ofs) throw std::runtime_error("Cannot write CSV: " + path);
     ofs << "flow_id,proto,addr_a,port_a,addr_b,port_b,packets_a2b,bytes_a2b,packets_b2a,bytes_b2a,"
            "total_packets,total_bytes,duration_sec,retransmissions,avg_rtt_ms\n";
@@ -4455,7 +4493,7 @@ void Capture::save_top_talkers_csv(const std::string& path) const {
         return;
     }
     ensure_parent_dir(path);
-    std::ofstream ofs(path);
+    std::ofstream ofs(path, std::ios::binary); // LF line endings on every platform
     if (!ofs) throw std::runtime_error("Cannot write CSV: " + path);
 
     struct Talker {
@@ -4512,7 +4550,7 @@ void Capture::save_protocol_hierarchy_csv(const std::string& path) const {
         return;
     }
     ensure_parent_dir(path);
-    std::ofstream ofs(path);
+    std::ofstream ofs(path, std::ios::binary); // LF line endings on every platform
     if (!ofs) throw std::runtime_error("Cannot write CSV: " + path);
 
     std::map<std::string, std::pair<int64_t, int64_t>> pstats;
@@ -4553,7 +4591,7 @@ void Capture::save_io_graph_csv(double bucket_sec, const std::string& path) cons
         return;
     }
     ensure_parent_dir(path);
-    std::ofstream ofs(path);
+    std::ofstream ofs(path, std::ios::binary); // LF line endings on every platform
     if (!ofs) throw std::runtime_error("Cannot write CSV: " + path);
 
     ofs << "time,total_pkts,total_bytes,total_mbps,tcp_bytes,udp_bytes,icmp_bytes,dns_bytes,"
@@ -4622,7 +4660,7 @@ void Capture::save_time_sequence_csv(int64_t stream_id, const std::string& path)
         return;
     }
     ensure_parent_dir(path);
-    std::ofstream ofs(path);
+    std::ofstream ofs(path, std::ios::binary); // LF line endings on every platform
     if (!ofs) throw std::runtime_error("Cannot write CSV: " + path);
 
     ofs << "time,direction,rel_seq,rel_ack,payload_len,window,is_retrans,is_ooo,rtt_ms,flags\n";
@@ -4645,7 +4683,7 @@ void Capture::save_json(const std::string& path) const {
         return;
     }
     ensure_parent_dir(path);
-    std::ofstream ofs(path);
+    std::ofstream ofs(path, std::ios::binary); // LF line endings on every platform
     if (!ofs) throw std::runtime_error("Cannot write JSON: " + path);
 
     ofs << std::fixed << std::setprecision(6);

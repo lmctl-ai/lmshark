@@ -29,6 +29,9 @@ assert_eq(c.pkt_field(12, "tcp.analysis.fast_retransmission"), "true");
 assert_eq(c.pkt_field(12, "tcp.analysis.bytes_in_flight"), "400");
 assert_eq(c.pkt_field(13, "tcp.analysis.ack_rtt"), "21.000");
 assert_eq(c.count("tcp.analysis.fast_retransmission"), 1);
+assert_eq(c.count("tcp.analysis.ack_rtt > 20"), 1);
+assert_eq(c.count("tcp.analysis.bytes_in_flight >= 400"), 3);
+assert_eq(c.count("tcp.flags.reset == 0 && tcp.flags.push == 1"), 6);
 assert_eq(c.tcp_stream_bytes(0, "client"), 500);
 
 # 2. Out-of-order segment and overlapping retransmission: first copy wins

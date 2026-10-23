@@ -58,8 +58,8 @@ plot.cmd("set title 'WAN Handshake Head-Start (40 ms RTT): QUIC v2 (1-RTT) vs TL
 plot.cmd("set xlabel 'Elapsed WAN Time (s)'");
 plot.cmd("set ylabel 'Cumulative Delivered Bytes'");
 plot.cmd("set xrange [0:0.27]");
-plot.cmd("set yrange [0:15500]");
-plot.cmd("set key top left box opaque");
+plot.cmd("set yrange [0:22000]");
+plot.cmd("set key top left box opaque font ',10'");
 plot.cmd("set arrow 1 from 0.045,0 to 0.045,14000 nohead lw 1.6 dt 3 lc rgb '#2ea043'");
 plot.cmd("set label 1 'QUIC App Data\n(t = 45 ms)' at 0.047,11200 tc rgb '#2ea043' font ',9'");
 plot.cmd("set arrow 2 from 0.085,0 to 0.085,14000 nohead lw 1.6 dt 3 lc rgb '#8957e5'");

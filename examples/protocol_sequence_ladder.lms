@@ -34,6 +34,8 @@ assert_eq(verified.packet_count(), 14);
 assert_eq(verified.pkt_field(3, "dns.answer"), "93.184.216.34");
 assert_eq(verified.pkt_field(7, "tls.sni"), "api.lmctl.ai");
 assert_eq(verified.pkt_field(13, "http.status"), "200");
+assert_eq(verified.pkt_field(12, "tcp.len"), "121");
+assert_eq(verified.pkt_field(8, "tls.version"), "TLS 1.3");
 verified.save_packets_csv("build/examples/protocol_ladder_packets.csv");
 end _dsl_
 savedsl(p, "build/examples/protocol_ladder.dslb");
@@ -71,46 +73,46 @@ scene.rect(24.0, 134.0, 852.0, 94.0, "#111c2a").set_attr("stroke", "#24354a").se
 scene.text(36.0, 152.0, 12.0, "L2/UDP", "#f2cc60").set_attr("font-weight", "700");
 
 scene.arrow(160.0, 150.0, 444.0, 162.0, "#f2cc60", 2.2);
-scene.text(305.0, 148.0, 12.0, "t=1ms  ARP Who has 10.10.1.1? -> 02:10:20:30:40:fe", "#f2cc60").set_attr("text-anchor", "middle");
+scene.text(305.0, 141.0, 12.0, "t=1ms  ARP Who has 10.10.1.1? -> 02:10:20:30:40:fe", "#f2cc60").set_attr("text-anchor", "middle");
 
 scene.arrow(160.0, 182.0, 444.0, 194.0, "#58a6ff", 2.2);
-scene.text(305.0, 180.0, 12.0, "t=5ms  DNS Query 0x4a1f A api.lmctl.ai (UDP :53)", "#79c0ff").set_attr("text-anchor", "middle");
+scene.text(305.0, 173.0, 12.0, "t=5ms  DNS Query 0x4a1f A api.lmctl.ai (UDP :53)", "#79c0ff").set_attr("text-anchor", "middle");
 
-scene.arrow(450.0, 212.0, 166.0, 222.0, "#58a6ff", 2.2);
-scene.text(305.0, 206.0, 12.0, "t=14ms DNS Response A -> 93.184.216.34 (NOERROR)", "#a5d6ff").set_attr("text-anchor", "middle");
+scene.arrow(450.0, 216.0, 166.0, 225.0, "#58a6ff", 2.2);
+scene.text(305.0, 208.0, 12.0, "t=14ms DNS Response A -> 93.184.216.34 (NOERROR)", "#a5d6ff").set_attr("text-anchor", "middle");
 
 # Phase 2: TCP 3-Way Handshake (Client <-> API Edge)
 scene.rect(24.0, 240.0, 852.0, 110.0, "#111c2a").set_attr("stroke", "#24354a").set_attr("stroke-width", "1");
 scene.text(36.0, 258.0, 12.0, "L4 TCP", "#3fb950").set_attr("font-weight", "700");
 
 scene.arrow(160.0, 258.0, 734.0, 274.0, "#3fb950", 2.4);
-scene.text(450.0, 256.0, 12.0, "t=16ms [SYN] Seq=0 Win=64240 (51443 -> 443)", "#56d364").set_attr("text-anchor", "middle");
+scene.text(450.0, 254.0, 12.0, "t=16ms [SYN] Seq=0 Win=64240 (51443 -> 443)", "#56d364").set_attr("text-anchor", "middle");
 
 scene.arrow(740.0, 292.0, 166.0, 308.0, "#3fb950", 2.4);
-scene.text(450.0, 292.0, 12.0, "t=24ms [SYN,ACK] Seq=0 Ack=1 Win=65535", "#7ee787").set_attr("text-anchor", "middle");
+scene.text(450.0, 285.0, 12.0, "t=24ms [SYN,ACK] Seq=0 Ack=1 Win=65535", "#7ee787").set_attr("text-anchor", "middle");
 
 scene.arrow(160.0, 324.0, 734.0, 340.0, "#3fb950", 2.4);
-scene.text(450.0, 324.0, 12.0, "t=32ms [ACK] Seq=1 Ack=1 (Handshake RTT = 16.0 ms)", "#56d364").set_attr("text-anchor", "middle");
+scene.text(450.0, 317.0, 12.0, "t=32ms [ACK] Seq=1 Ack=1 (Handshake RTT = 16.0 ms)", "#56d364").set_attr("text-anchor", "middle");
 
 # Phase 3: TLS 1.3 Cryptographic Handshake
 scene.rect(24.0, 362.0, 852.0, 92.0, "#111c2a").set_attr("stroke", "#24354a").set_attr("stroke-width", "1");
 scene.text(36.0, 380.0, 12.0, "L7 TLS", "#d2a8ff").set_attr("font-weight", "700");
 
 scene.arrow(160.0, 384.0, 734.0, 400.0, "#bc8cff", 2.5);
-scene.text(450.0, 382.0, 12.0, "t=35ms TLS 1.3 ClientHello (SNI=api.lmctl.ai, ALPN=h2)", "#d2a8ff").set_attr("text-anchor", "middle");
+scene.text(450.0, 375.0, 12.0, "t=35ms TLS 1.3 ClientHello (SNI=api.lmctl.ai, ALPN=h2)", "#d2a8ff").set_attr("text-anchor", "middle");
 
 scene.arrow(740.0, 422.0, 166.0, 438.0, "#bc8cff", 2.5);
-scene.text(450.0, 422.0, 12.0, "t=44ms TLS 1.3 ServerHello [Cipher=0x1301 AES_128_GCM_SHA256]", "#e2c5ff").set_attr("text-anchor", "middle");
+scene.text(450.0, 415.0, 12.0, "t=44ms TLS 1.3 ServerHello [Cipher=0x1301 AES_128_GCM_SHA256]", "#e2c5ff").set_attr("text-anchor", "middle");
 
 # Phase 4: HTTP/1.1 Application Exchange
 scene.rect(24.0, 466.0, 852.0, 108.0, "#111c2a").set_attr("stroke", "#24354a").set_attr("stroke-width", "1");
 scene.text(36.0, 484.0, 12.0, "L7 HTTP", "#ff7b72").set_attr("font-weight", "700");
 
 scene.arrow(160.0, 492.0, 734.0, 510.0, "#ff7b72", 2.5);
-scene.text(450.0, 490.0, 12.0, "t=68ms HTTP POST /v1/events Host: api.lmctl.ai (121 B)", "#ffa198").set_attr("text-anchor", "middle");
+scene.text(450.0, 483.0, 12.0, "t=68ms HTTP POST /v1/events Host: api.lmctl.ai (121 B)", "#ffa198").set_attr("text-anchor", "middle");
 
 scene.arrow(740.0, 536.0, 166.0, 554.0, "#ff7b72", 2.5);
-scene.text(450.0, 536.0, 12.0, "t=78ms HTTP/1.1 200 OK application/json {\"status\":\"recorded\"}", "#ff7b72").set_attr("text-anchor", "middle");
+scene.text(450.0, 529.0, 12.0, "t=78ms HTTP/1.1 200 OK application/json {\"status\":\"recorded\"}", "#ff7b72").set_attr("text-anchor", "middle");
 
 scene.render_png("build/rendered/protocol_sequence_ladder.png", 900, 620, 1);
 end _dsl_

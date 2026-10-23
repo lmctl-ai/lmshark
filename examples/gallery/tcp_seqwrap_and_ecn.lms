@@ -76,7 +76,7 @@ plot.cmd("set ytics nomirror");
 plot.cmd("set y2tics 0, 16000, 68000");
 plot.cmd("set yrange [0:3000]");
 plot.cmd("set y2range [0:74000]");
-plot.cmd("set key bottom right box opaque noenhanced");
+plot.cmd("set key bottom right box opaque noenhanced font ',9' samplen 2");
 plot.cmd("set arrow 1 from 0.0,1025 to 0.31,1025 nohead lw 1.8 dt 2 lc rgb '#8957e5'");
 plot.cmd("set label 1 '32-Bit Wire Sequence Wrap Boundary (raw seq 0xFFFFFFFF -> 0x00000000 at rel = 1025 B)' at 0.010,1120 tc rgb '#8957e5' noenhanced font ',9'");
 plot.cmd("set arrow 2 from 0.176,1200 to 0.176,2250 nohead lw 1.6 dt 3 lc rgb '#d29922'");

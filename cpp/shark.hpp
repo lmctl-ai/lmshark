@@ -101,7 +101,8 @@ struct DissectedPacket {
     bool tcp_zero_window = false;
     bool tcp_fast_retransmission = false;
     double tcp_rtt_ms = 0.0;
-    int64_t tcp_bytes_in_flight = -1; // unacked bytes after this data segment (-1 if not data)
+    int64_t tcp_bytes_in_flight = -1;
+    int64_t tcp_acked_bytes = 0;      // sequence space newly acknowledged by this ACK (goodput) // unacked bytes after this data segment (-1 if not data)
 
     // Layer 4: UDP (RFC 768)
     bool has_udp = false;

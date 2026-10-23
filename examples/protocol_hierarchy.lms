@@ -51,7 +51,10 @@ for (i in range(0, 4)) {
 }
 
 cap.save_protocol_hierarchy_csv("build/examples/protocol_hierarchy.csv");
-assert_eq(cap.packet_count() > 90, true);
+assert_eq(cap.packet_count(), 113);
+assert_eq(cap.protocol_packets("QUIC"), 28);
+assert_eq(cap.protocol_packets("TLS"), 22);
+assert_eq(cap.protocol_bytes("QUIC"), 33684);
 end _dsl_
 savedsl(p, "build/examples/protocol_hierarchy.dslb");
 r = system ${dsl_cli(p)} --dsl build/examples/protocol_hierarchy.dslb;
@@ -59,25 +62,33 @@ assert(r.code == 0);
 
 # 2. Plot Protocol Hierarchy Breakdown (Bytes % and Packet Count) in lmplot
 plt = _dsl_ cli="lmplot" install="github:lmctl-ai/lmplot@latest";
-plot.png("images/protocol_hierarchy.png", 900, 560);
+plot.png("images/protocol_hierarchy.png", 960, 540);
 plot.cmd("set datafile separator ','");
 plot.cmd("set grid y lw 1 lc rgb '#d0d7de'");
-plot.cmd("set style data boxes");
-plot.cmd("set boxwidth 0.58 relative");
-plot.cmd("set style fill solid 0.82 border -1");
-plot.cmd("set multiplot layout 1,2 title 'Dissected Layer-4 / Layer-7 Protocol Hierarchy Breakdown (lmshark)' font ',13'");
+plot.cmd("set multiplot layout 1,2 title 'Campus Capture Protocol Hierarchy: who owns the bytes vs who owns the packets (lmshark)' font ',13'");
 
-plot.cmd("set title 'Traffic Volume Share (% of Wire Bytes)' font ',11'");
-plot.cmd("set xlabel 'Dissected Protocol'");
-plot.cmd("set ylabel 'Share of Total Bytes (%)'");
-plot.cmd("set yrange [0:60]");
-plot.cmd("plot 'build/examples/protocol_hierarchy.csv' every ::1 using 0:5:xtic(1) with boxes lc rgb '#0969da' notitle, '' every ::1 using 0:($5+2.5):(sprintf('%.1f%%', $5)) with labels font ',9' notitle");
+# Left: pie of wire-byte share (angles accumulated from pct_bytes) with a full legend
+plot.cmd("set title 'Share of wire bytes' font ',11'");
+plot.cmd("unset border; unset tics; unset key; unset grid");
+plot.cmd("set size ratio -1");
+plot.cmd("set xrange [-1.08:2.35]");
+plot.cmd("set yrange [-1.25:1.25]");
+plot.cmd("set linetype 1 lc rgb '#0969da'; set linetype 2 lc rgb '#8250df'; set linetype 3 lc rgb '#cf222e'; set linetype 4 lc rgb '#bf8700'");
+plot.cmd("set linetype 5 lc rgb '#1a7f37'; set linetype 6 lc rgb '#e16f24'; set linetype 7 lc rgb '#57606a'; set linetype 8 lc rgb '#0598bc'");
+plot.cmd("set style fill solid 0.95 border lc rgb '#ffffff'");
+plot.cmd("a = 90.0; b = 90.0");
+plot.cmd("plot 'build/examples/protocol_hierarchy.csv' every ::1 using (0):(0):(1.0):(b = a, a = a - 3.6*$5, a):(b):(int($0)+1) with circles lc variable notitle, a = 90.0, '' every ::1 using (m = a - 1.8*$5, a = a - 3.6*$5, ($5 > 8 ? 0.6*cos(m*pi/180) : 1/0)):(0.6*sin(m*pi/180)):(sprintf('%s\\n%.1f%%', strcol(1), $5)) with labels tc rgb '#ffffff' font ',11' notitle, '' every ::1 using (1.22):(0.98 - 0.28*$0):(int($0)+1) with points pt 5 ps 2.0 lc variable notitle, '' every ::1 using (1.34):(0.98 - 0.28*$0):(sprintf('%-5s %5.1f%%  (%d B)', strcol(1), $5, $3)) with labels left font ',10' notitle");
 
-plot.cmd("set title 'Dissected Frame Count by Protocol' font ',11'");
-plot.cmd("set xlabel 'Dissected Protocol'");
-plot.cmd("set ylabel 'Packet Count'");
-plot.cmd("set yrange [0:35]");
-plot.cmd("plot 'build/examples/protocol_hierarchy.csv' every ::1 using 0:2:xtic(1) with boxes lc rgb '#2ea043' notitle, '' every ::1 using 0:($2+1.4):(sprintf('%d', $2)) with labels font ',9' notitle");
+# Right: packet counts (horizontal bars, so long names never collide)
+plot.cmd("set title 'Dissected frames by protocol' font ',11'");
+plot.cmd("set border 3; set grid x lw 1 lc rgb '#d0d7de'");
+plot.cmd("set size noratio");
+plot.cmd("set xtics nomirror; set ytics nomirror");
+plot.cmd("set xrange [0:34]");
+plot.cmd("set yrange [7.6:-0.6]");
+plot.cmd("set xlabel 'Packets'");
+plot.cmd("set style fill solid 0.85 noborder");
+plot.cmd("plot 'build/examples/protocol_hierarchy.csv' every ::1 using (0.5*$2):0:(0.5*$2):(0.32):(int($0)+1):ytic(1) with boxxyerror lc variable notitle, '' every ::1 using ($2+0.6):0:(sprintf('%d', $2)) with labels left font ',9' notitle");
 plot.cmd("unset multiplot");
 plot.close();
 end _dsl_
