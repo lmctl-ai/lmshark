@@ -1,4 +1,6 @@
+mkdir("build");
 mkdir("build/examples");
+mkdir("build/rendered");
 mkdir("images");
 mkdir("docs/images");
 
@@ -130,9 +132,10 @@ scene.text(644.0, 149.0, 12.0, "2. 10.40.0.10 (Ingress) 29.7 KB", "#79c0ff");
 scene.text(644.0, 168.0, 12.0, "3. 10.40.1.20 (Auth)     7.6 KB", "#d2a8ff");
 scene.text(644.0, 187.0, 12.0, "4. 10.40.3.40 (Postgres) 3.1 KB", "#56d364");
 
-scene.render_png("images/top_talkers_topology.png", 900, 580, 1);
+scene.render_png("build/rendered/top_talkers_topology.png", 900, 580, 1);
 end _dsl_
 savedsl(draw, "build/examples/top_talkers_draw.dslb");
 rd = system ${dsl_cli(draw)} --dsl build/examples/top_talkers_draw.dslb;
 assert(rd.code == 0);
-copy_file("images/top_talkers_topology.png", "docs/images/top_talkers_topology.png");
+copy_file("build/rendered/top_talkers_topology.png", "images/top_talkers_topology.png");
+copy_file("build/rendered/top_talkers_topology.png", "docs/images/top_talkers_topology.png");
