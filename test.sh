@@ -39,7 +39,8 @@ ok "native C++ protocol & pcap/pcapng regression tests"
 want_version="lmshark $(sed -n 's/^project(lmshark VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
 [ "$("$HOST" --version)" = "$want_version" ] || fail "--version is not exactly '$want_version'"
 ok "--version prints exactly '$want_version'"
-python3 scripts/gen-schema.py >/dev/null && git diff --quiet -- schema/lmshark.dsl.json 2>/dev/null || [ ! -e .git ] || fail "schema/lmshark.dsl.json is stale: run scripts/gen-schema.py"
+cp schema/lmshark.dsl.json "$WORK/schema.before"
+python3 scripts/gen-schema.py >/dev/null && cmp -s "$WORK/schema.before" schema/lmshark.dsl.json || fail "schema/lmshark.dsl.json is stale: run scripts/gen-schema.py"
 ok "schema matches the registrations in cpp/main.cpp"
 "$HOST" --dsl-schema --json >"$WORK/schema.json" || fail "embedded schema print"
 cmp -s "$WORK/schema.json" schema/lmshark.dsl.json || fail "embedded schema differs from schema/lmshark.dsl.json"
@@ -115,7 +116,7 @@ else
   ok "examples skipped loudly (no lmplot/lmdraw, LMSHARK_TEST_NETWORK unset)"
 fi
 
-# Error paths: each snippet must fail the run with exit 3 and a message naming the problem.
+# Error paths: each snippet must fail the run with exit 3 and a message naming the problem on both stdout JSON and stderr.
 expect_error() {
   cat >"$WORK/$1.lms" <<LMS
 p = _dsl_ cli="lmshark";
@@ -124,10 +125,25 @@ end _dsl_
 savedsl(p, "$WORK/$1.dslb");
 LMS
   "$LMSCRIPT" "$WORK/$1.lms" >/dev/null 2>"$WORK/$1.cerr" || { cat "$WORK/$1.cerr" >&2; fail "$1 compile"; }
-  set +e; out="$("$HOST" --dsl "$WORK/$1.dslb" 2>/dev/null)"; code=$?; set -e
+  set +e; out="$("$HOST" --dsl "$WORK/$1.dslb" 2>"$WORK/$1.runerr")"; code=$?; set -e
   [ "$code" = 3 ] || fail "$1: exit code $code, expected 3 ($out)"
-  echo "$out" | grep -q "$3" || fail "$1: message lacks '$3': $out"
+  echo "$out" | grep -qi "$3" || fail "$1: stdout JSON lacks '$3': $out"
+  grep -qi "$3" "$WORK/$1.runerr" || fail "$1: stderr lacks '$3': $(cat "$WORK/$1.runerr")"
 }
+
+python3 - "$WORK" <<'PY'
+import struct, sys, pathlib
+w = pathlib.Path(sys.argv[1])
+(w / "bad_magic.pcap").write_bytes(struct.pack("<IHHIIII", 0xdeadbeef, 2, 4, 0, 0, 65535, 1))
+(w / "bad_version.pcap").write_bytes(struct.pack("<IHHIIII", 0xa1b2c3d4, 9, 9, 0, 0, 65535, 1))
+(w / "bad_snaplen.pcap").write_bytes(struct.pack("<IHHIIII", 0xa1b2c3d4, 2, 4, 0, 0, 0, 1))
+(w / "bad_linktype.pcap").write_bytes(struct.pack("<IHHIIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 999))
+(w / "trunc_rec.pcap").write_bytes(struct.pack("<IHHIIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1) + b"\x01\x02\x03\x04")
+shb = struct.pack("<IIIHHqI", 0x0a0d0d0a, 28, 0x1a2b3c4d, 1, 0, -1, 28)
+idb = struct.pack("<IIHHI", 1, 20, 1, 0, 65535) + struct.pack("<I", 20)
+epb = struct.pack("<IIIIIII", 6, 32, 0, 0, 0, 0xfffffff0, 64) + struct.pack("<I", 32)
+(w / "overflow-epb.pcapng").write_bytes(shb + idb + epb)
+PY
 
 expect_error badmac 'let c = shark.capture(); c.set_macs("not-a-mac", "02:00:00:00:00:02");' "Invalid MAC"
 expect_error badvlan 'let c = shark.capture(); c.set_vlan(5000);' "VLAN ID"
@@ -136,6 +152,13 @@ expect_error badipv6 'let c = shark.capture(); c.icmpv6_echo_request(0.0, "2001:
 expect_error badindex 'let c = shark.capture(); let x = c.pkt_proto(0);' "out of range"
 expect_error negindex 'let c = shark.capture(); let x = c.pkt_len(-1);' "out of range"
 expect_error badfile 'let c = shark.open("does-not-exist.pcap");' "Cannot open"
+expect_error badmagic "let c = shark.open(\"$WORK/bad_magic.pcap\");" "Unrecognized capture file magic"
+expect_error badver "let c = shark.open(\"$WORK/bad_version.pcap\");" "Unsupported PCAP version"
+expect_error badsnap "let c = shark.open(\"$WORK/bad_snaplen.pcap\");" "Invalid PCAP snaplen"
+expect_error badlt "let c = shark.open(\"$WORK/bad_linktype.pcap\");" "Unsupported PCAP linktype"
+expect_error truncrec "let c = shark.open(\"$WORK/trunc_rec.pcap\");" "Trailing partial"
+expect_error overflowepb "let c = shark.open(\"$WORK/overflow-epb.pcapng\");" "Corrupt EPB packet captured length"
+expect_error mixedpcap "let c = shark.capture(); c.icmp_echo_request(0.0, \"10.0.0.1\", \"10.0.0.2\", 1, 1, 64, 8); c.raw_frame(1.0, \"4500001c00010000400166cc0a0000010a0000020800f7fd00010001\", 101); c.save_pcap(\"$WORK/mixed.pcap\");" "mixed link types"
 expect_error badfilter 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); let f = c.filter("tcp.port ==");' "Expected value"
 expect_error badparen 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); let f = c.filter("(tcp");' "Missing closing"
 expect_error badbpf 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); let f = c.bpf("unknown_primitive");' "Unknown BPF"
@@ -143,7 +166,15 @@ expect_error badbucket 'let c = shark.capture(); c.save_io_graph_csv(0.0, "$WORK
 expect_error assertint 'assert_eq(1, 2);' "assert_eq(int)"
 expect_error assertstr 'assert_eq("TCP", "UDP");' "assert_eq(string)"
 expect_error assertclose 'assert_close(1.0, 2.0, 0.1);' "assert_close"
-ok "errors stop with exit 3 and clear messages (14 cases)"
+if [ -w /dev/full ]; then
+  expect_error devfull_pcap 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_pcap("/dev/full");' "Error writing"
+  expect_error devfull_pcapng 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_pcapng("/dev/full");' "Error writing"
+  expect_error devfull_csv 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_packets_csv("/dev/full");' "Error writing"
+  expect_error devfull_json 'let c = shark.capture(); c.icmp_echo_request(0.0, "10.0.0.1", "8.8.8.8", 1, 1, 64, 16); c.save_json("/dev/full");' "Error writing"
+  ok "errors (including malformed headers, mixed linktypes, overflow EPB, and /dev/full writes) stop with exit 3 and stderr messages (25 cases)"
+else
+  ok "errors (including malformed headers, mixed linktypes, and overflow EPB) stop with exit 3 and stderr messages (21 cases)"
+fi
 
 # Memory budget: a runaway loop duplicating multi-megabyte captures stops with a run error (exit 3)
 # instead of exhausting the machine. Tested at 64 MiB everywhere and at default 4096 MiB under ulimit -v on Linux.

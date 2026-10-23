@@ -1,4 +1,5 @@
 #include "shark.hpp"
+#include "memory_budget.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -27,6 +28,17 @@ void ensure_parent_dir(const std::string& path) {
     }
 }
 
+void finish_output_stream(std::ofstream& ofs, const std::string& path) {
+    ofs.flush();
+    if (!ofs) {
+        throw std::runtime_error("I/O error writing output file: " + path);
+    }
+    ofs.close();
+    if (!ofs) {
+        throw std::runtime_error("I/O error closing output file: " + path);
+    }
+}
+
 uint16_t read_u16_be(const uint8_t* p) {
     return (static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]);
 }
@@ -51,6 +63,14 @@ uint16_t read_u16_endian(const uint8_t* p, bool big_endian) {
 
 uint32_t read_u32_endian(const uint8_t* p, bool big_endian) {
     return big_endian ? read_u32_be(p) : read_u32_le(p);
+}
+
+uint64_t read_u64_endian(const uint8_t* p, bool big_endian) {
+    if (big_endian) {
+        return (static_cast<uint64_t>(read_u32_be(p)) << 32) | read_u32_be(p + 4);
+    }
+    return static_cast<uint64_t>(read_u32_le(p)) |
+           (static_cast<uint64_t>(read_u32_le(p + 4)) << 32);
 }
 
 void push_u16_be(std::vector<uint8_t>& buf, uint16_t v) {
@@ -319,6 +339,18 @@ uint16_t ipv4_l4_checksum(const std::vector<uint8_t>& src_ip, const std::vector<
     return csum;
 }
 
+bool verify_ipv4_l4_checksum(const std::vector<uint8_t>& src_ip, const std::vector<uint8_t>& dst_ip,
+                             uint8_t proto, const uint8_t* l4_data, size_t l4_len) {
+    uint32_t sum = 0;
+    sum += (static_cast<uint32_t>(src_ip[0]) << 8) | src_ip[1];
+    sum += (static_cast<uint32_t>(src_ip[2]) << 8) | src_ip[3];
+    sum += (static_cast<uint32_t>(dst_ip[0]) << 8) | dst_ip[1];
+    sum += (static_cast<uint32_t>(dst_ip[2]) << 8) | dst_ip[3];
+    sum += proto;
+    sum += static_cast<uint32_t>(l4_len);
+    return ones_complement_checksum(l4_data, l4_len, sum) == 0;
+}
+
 uint16_t ipv6_l4_checksum(const std::vector<uint8_t>& src_ip6, const std::vector<uint8_t>& dst_ip6,
                           uint8_t next_hdr, const uint8_t* l4_data, size_t l4_len) {
     uint32_t sum = 0;
@@ -334,6 +366,19 @@ uint16_t ipv6_l4_checksum(const std::vector<uint8_t>& src_ip6, const std::vector
         return 0xFFFF;
     }
     return csum;
+}
+
+bool verify_ipv6_l4_checksum(const std::vector<uint8_t>& src_ip6, const std::vector<uint8_t>& dst_ip6,
+                             uint8_t next_hdr, const uint8_t* l4_data, size_t l4_len) {
+    uint32_t sum = 0;
+    for (size_t i = 0; i < 16; i += 2) {
+        sum += (static_cast<uint32_t>(src_ip6[i]) << 8) | src_ip6[i + 1];
+        sum += (static_cast<uint32_t>(dst_ip6[i]) << 8) | dst_ip6[i + 1];
+    }
+    sum += static_cast<uint32_t>((l4_len >> 16) & 0xFFFF);
+    sum += static_cast<uint32_t>(l4_len & 0xFFFF);
+    sum += next_hdr;
+    return ones_complement_checksum(l4_data, l4_len, sum) == 0;
 }
 
 void append_eth_header(std::vector<uint8_t>& pkt, const std::string& src_mac,
@@ -352,7 +397,8 @@ void append_eth_header(std::vector<uint8_t>& pkt, const std::string& src_mac,
 void append_ipv4_packet(std::vector<uint8_t>& frame, const std::string& src_mac,
                         const std::string& dst_mac, uint16_t vlan_id, const std::string& src_ip_str,
                         const std::string& dst_ip_str, uint8_t proto, uint8_t ttl,
-                        const std::vector<uint8_t>& l4_payload, uint16_t ip_id = 0x1234) {
+                        const std::vector<uint8_t>& l4_payload, uint16_t ip_id = 0x1234,
+                        uint16_t frag_field = 0x4000) {
     append_eth_header(frame, src_mac, dst_mac, vlan_id, 0x0800);
     auto src_ip = parse_ipv4(src_ip_str);
     auto dst_ip = parse_ipv4(dst_ip_str);
@@ -364,7 +410,7 @@ void append_ipv4_packet(std::vector<uint8_t>& frame, const std::string& src_mac,
     ip_hdr.push_back(0x00); // DSCP/ECN
     push_u16_be(ip_hdr, total_len);
     push_u16_be(ip_hdr, ip_id);
-    push_u16_be(ip_hdr, 0x4000); // Don't Fragment
+    push_u16_be(ip_hdr, frag_field);
     ip_hdr.push_back(ttl);
     ip_hdr.push_back(proto);
     push_u16_be(ip_hdr, 0x0000); // Checksum placeholder
@@ -396,19 +442,22 @@ void append_ipv6_packet(std::vector<uint8_t>& frame, const std::string& src_mac,
     frame.insert(frame.end(), l4_payload.begin(), l4_payload.end());
 }
 
-uint8_t parse_tcp_flags(const std::string& flags_str) {
+uint16_t parse_tcp_flags(const std::string& flags_str) {
     std::string u = to_upper(flags_str);
-    uint8_t f = 0;
+    uint16_t f = 0;
     if (u.find("FIN") != std::string::npos) f |= 0x01;
     if (u.find("SYN") != std::string::npos) f |= 0x02;
     if (u.find("RST") != std::string::npos) f |= 0x04;
     if (u.find("PSH") != std::string::npos) f |= 0x08;
     if (u.find("ACK") != std::string::npos) f |= 0x10;
     if (u.find("URG") != std::string::npos) f |= 0x20;
+    if (u.find("ECE") != std::string::npos) f |= 0x40;
+    if (u.find("CWR") != std::string::npos) f |= 0x80;
+    if (u.find("NS") != std::string::npos) f |= 0x100;
     return f;
 }
 
-std::string format_tcp_flags(uint8_t flags) {
+std::string format_tcp_flags(uint16_t flags) {
     std::vector<std::string> parts;
     if (flags & 0x02) parts.push_back("SYN");
     if (flags & 0x01) parts.push_back("FIN");
@@ -416,6 +465,9 @@ std::string format_tcp_flags(uint8_t flags) {
     if (flags & 0x08) parts.push_back("PSH");
     if (flags & 0x10) parts.push_back("ACK");
     if (flags & 0x20) parts.push_back("URG");
+    if (flags & 0x40) parts.push_back("ECE");
+    if (flags & 0x80) parts.push_back("CWR");
+    if (flags & 0x100) parts.push_back("NS");
     if (parts.empty()) return "NONE";
     std::string out;
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -824,6 +876,7 @@ void dissect_tls(DissectedPacket& p, const uint8_t* data, size_t len) {
     if (ctype < 20 || ctype > 23) return;
     if (rver < 0x0300 || rver > 0x0304) return;
     if (5u + rlen > len) return;
+    size_t rec_end = 5u + rlen;
 
     p.has_tls = true;
     p.protocol = "TLS";
@@ -831,42 +884,64 @@ void dissect_tls(DissectedPacket& p, const uint8_t* data, size_t len) {
     p.tls_record_version = tls_version_name(rver);
     p.tls_version = p.tls_record_version;
 
-    if (ctype == 22 && len >= 9) {
+    if (ctype == 22 && rec_end >= 9) {
         uint8_t htype = data[5];
+        uint32_t hs_len = (static_cast<uint32_t>(data[6]) << 16) |
+                          (static_cast<uint32_t>(data[7]) << 8) | static_cast<uint32_t>(data[8]);
         p.tls_handshake_type = htype;
-        if ((htype == 1 || htype == 2) && len >= 43) {
+        if (9u + hs_len <= rec_end && (htype == 1 || htype == 2) && rec_end >= 43) {
+            size_t hs_end = 9u + hs_len;
             uint16_t ch_ver = read_u16_be(data + 9);
             p.tls_version = tls_version_name(ch_ver);
             size_t off = 43; // 5 record + 4 hs + 2 ver + 32 random
-            if (off < len) {
+            bool ok = true;
+            if (off < hs_end) {
                 uint8_t sid_len = data[off++];
-                off += sid_len;
+                if (off + sid_len <= hs_end) {
+                    off += sid_len;
+                } else {
+                    ok = false;
+                }
+            } else {
+                ok = false;
             }
-            if (htype == 1 && off + 2 <= len) {
+            if (ok && htype == 1 && off + 2 <= hs_end) {
                 uint16_t cs_len = read_u16_be(data + off);
-                if (cs_len >= 2 && off + 2 + 2 <= len) {
-                    p.tls_cipher_suite = read_u16_be(data + off + 2);
+                if (off + 2 + cs_len <= hs_end) {
+                    if (cs_len >= 2) {
+                        p.tls_cipher_suite = read_u16_be(data + off + 2);
+                    }
+                    off += 2 + cs_len;
+                    if (off < hs_end) {
+                        uint8_t comp_len = data[off++];
+                        if (off + comp_len <= hs_end) {
+                            off += comp_len;
+                        } else {
+                            ok = false;
+                        }
+                    } else {
+                        ok = false;
+                    }
+                } else {
+                    ok = false;
                 }
-                off += 2 + cs_len;
-                if (off < len) {
-                    uint8_t comp_len = data[off++];
-                    off += comp_len;
-                }
-            } else if (htype == 2 && off + 3 <= len) {
+            } else if (ok && htype == 2 && off + 3 <= hs_end) {
                 p.tls_cipher_suite = read_u16_be(data + off);
                 off += 3; // 2 cipher suite + 1 compression
+            } else {
+                ok = false;
             }
-            if (off + 2 <= len) {
+            if (ok && off + 2 <= hs_end) {
                 uint16_t ext_total = read_u16_be(data + off);
                 off += 2;
-                size_t ext_end = std::min(len, off + ext_total);
+                size_t ext_end = std::min(hs_end, off + ext_total);
                 while (off + 4 <= ext_end) {
                     uint16_t etype = read_u16_be(data + off);
                     uint16_t elen = read_u16_be(data + off + 2);
                     off += 4;
                     if (off + elen > ext_end) break;
                     if (etype == 0x0000 && elen >= 5) {
-                        // Server Name Indication
+                        // Server Name Indication (RFC 6066)
                         uint8_t name_type = data[off + 2];
                         uint16_t name_len = read_u16_be(data + off + 3);
                         if (name_type == 0 && 5u + name_len <= elen) {
@@ -874,7 +949,7 @@ void dissect_tls(DissectedPacket& p, const uint8_t* data, size_t len) {
                                              name_len);
                         }
                     } else if (etype == 0x002b && elen >= 2) {
-                        // supported_versions
+                        // supported_versions (RFC 8446)
                         if (htype == 1 && elen >= 3) {
                             uint8_t vlist_len = data[off];
                             uint16_t best_v = 0;
@@ -887,7 +962,7 @@ void dissect_tls(DissectedPacket& p, const uint8_t* data, size_t len) {
                             p.tls_version = tls_version_name(read_u16_be(data + off));
                         }
                     } else if (etype == 0x0010 && elen >= 3) {
-                        // ALPN
+                        // ALPN (RFC 7301)
                         uint8_t proto_len = data[off + 2];
                         if (3u + proto_len <= elen) {
                             p.tls_alpn.assign(reinterpret_cast<const char*>(data + off + 3),
@@ -919,12 +994,163 @@ void dissect_tls(DissectedPacket& p, const uint8_t* data, size_t len) {
     }
 }
 
+void dissect_l4_and_above(DissectedPacket& p, uint8_t l4_proto, const uint8_t* l4_buf,
+                          size_t l4_len, uint32_t base_offset) {
+    if (l4_proto == 1 && p.has_ipv4) {
+        // ICMPv4 (RFC 792)
+        if (l4_len < 8) return;
+        p.has_icmp = true;
+        p.protocol = "ICMP";
+        p.icmp_type = l4_buf[0];
+        p.icmp_code = l4_buf[1];
+        p.icmp_id = read_u16_be(l4_buf + 4);
+        p.icmp_seq = read_u16_be(l4_buf + 6);
+        p.icmp_checksum_ok = (ones_complement_checksum(l4_buf, l4_len) == 0);
+        if (p.icmp_type == 8) {
+            p.info = "Echo (ping) request id=" + std::to_string(p.icmp_id) +
+                     " seq=" + std::to_string(p.icmp_seq) + " ttl=" + std::to_string(p.ip_ttl);
+        } else if (p.icmp_type == 0) {
+            p.info = "Echo (ping) reply id=" + std::to_string(p.icmp_id) +
+                     " seq=" + std::to_string(p.icmp_seq) + " ttl=" + std::to_string(p.ip_ttl);
+        } else if (p.icmp_type == 11) {
+            p.info = "Time-to-live exceeded in transit";
+        } else if (p.icmp_type == 3) {
+            p.info = "Destination unreachable (code=" + std::to_string(p.icmp_code) + ")";
+        } else {
+            p.info = "ICMP type=" + std::to_string(p.icmp_type) +
+                     " code=" + std::to_string(p.icmp_code);
+        }
+    } else if (l4_proto == 58 && p.has_ipv6) {
+        // ICMPv6 (RFC 4443 / RFC 4861)
+        if (l4_len < 8) return;
+        p.has_icmpv6 = true;
+        p.protocol = "ICMPv6";
+        p.icmp_type = l4_buf[0];
+        p.icmp_code = l4_buf[1];
+        p.icmp_id = read_u16_be(l4_buf + 4);
+        p.icmp_seq = read_u16_be(l4_buf + 6);
+        auto sip6 = parse_ipv6(p.ip_src);
+        auto dip6 = parse_ipv6(p.ip_dst);
+        p.icmp_checksum_ok = verify_ipv6_l4_checksum(sip6, dip6, 58, l4_buf, l4_len);
+        if (p.icmp_type == 128) {
+            p.info = "Echo (ping) request v6 id=" + std::to_string(p.icmp_id) +
+                     " seq=" + std::to_string(p.icmp_seq);
+        } else if (p.icmp_type == 129) {
+            p.info = "Echo (ping) reply v6 id=" + std::to_string(p.icmp_id) +
+                     " seq=" + std::to_string(p.icmp_seq);
+        } else if (p.icmp_type == 135 && l4_len >= 24) {
+            p.info = "Neighbor Solicitation for " + format_ipv6(l4_buf + 8);
+        } else if (p.icmp_type == 136 && l4_len >= 24) {
+            p.info = "Neighbor Advertisement " + format_ipv6(l4_buf + 8);
+        } else {
+            p.info = "ICMPv6 type=" + std::to_string(p.icmp_type);
+        }
+    } else if (l4_proto == 6) {
+        // TCP (RFC 9293)
+        if (l4_len < 20) return;
+        uint8_t doff = static_cast<uint8_t>(((l4_buf[12] >> 4) & 0x0F) * 4);
+        if (doff < 20 || doff > l4_len) return;
+        p.has_tcp = true;
+        p.protocol = "TCP";
+        p.tcp_srcport = read_u16_be(l4_buf);
+        p.tcp_dstport = read_u16_be(l4_buf + 2);
+        p.tcp_seq = read_u32_be(l4_buf + 4);
+        p.tcp_ack = read_u32_be(l4_buf + 8);
+        uint16_t ns_bit = static_cast<uint16_t>((l4_buf[12] & 0x01) << 8);
+        p.tcp_flags = static_cast<uint16_t>(ns_bit | l4_buf[13]);
+        p.tcp_window = read_u16_be(l4_buf + 14);
+        p.tcp_hdr_len = doff;
+        p.tcp_payload_offset = base_offset + doff;
+        p.tcp_payload_len = static_cast<uint32_t>(l4_len - doff);
+        p.tcp_zero_window = (p.tcp_window == 0 && !p.flag_rst());
+
+        if (p.has_ipv4) {
+            auto sip = parse_ipv4(p.ip_src);
+            auto dip = parse_ipv4(p.ip_dst);
+            p.tcp_checksum_ok = verify_ipv4_l4_checksum(sip, dip, 6, l4_buf, l4_len);
+        } else if (p.has_ipv6) {
+            auto sip6 = parse_ipv6(p.ip_src);
+            auto dip6 = parse_ipv6(p.ip_dst);
+            p.tcp_checksum_ok = verify_ipv6_l4_checksum(sip6, dip6, 6, l4_buf, l4_len);
+        }
+
+        std::ostringstream inf;
+        inf << p.tcp_srcport << " -> " << p.tcp_dstport << " [" << format_tcp_flags(p.tcp_flags)
+            << "] Seq=" << p.tcp_seq << " Ack=" << p.tcp_ack << " Win=" << p.tcp_window
+            << " Len=" << p.tcp_payload_len;
+        p.info = inf.str();
+
+        if (p.tcp_payload_len > 0) {
+            const uint8_t* app = l4_buf + doff;
+            size_t alen = p.tcp_payload_len;
+            dissect_tls(p, app, alen);
+            if (!p.has_tls) {
+                dissect_http(p, app, alen);
+            }
+        }
+    } else if (l4_proto == 17) {
+        // UDP (RFC 768)
+        if (l4_len < 8) return;
+        p.has_udp = true;
+        p.protocol = "UDP";
+        p.udp_srcport = read_u16_be(l4_buf);
+        p.udp_dstport = read_u16_be(l4_buf + 2);
+        p.udp_len = read_u16_be(l4_buf + 4);
+        uint16_t udp_csum_wire = read_u16_be(l4_buf + 6);
+        p.udp_payload_offset = base_offset + 8;
+        size_t avail = l4_len - 8;
+        if (p.udp_len >= 8 && static_cast<size_t>(p.udp_len - 8) <= avail) {
+            p.udp_payload_len = p.udp_len - 8;
+        } else {
+            p.udp_payload_len = static_cast<uint32_t>(avail);
+        }
+
+        if (p.udp_len < 8 || static_cast<size_t>(p.udp_len) > l4_len) {
+            p.udp_checksum_ok = false;
+        } else if (p.has_ipv4) {
+            if (udp_csum_wire == 0) {
+                p.udp_checksum_ok = true; // RFC 768: zero means checksum not computed in IPv4
+            } else {
+                auto sip = parse_ipv4(p.ip_src);
+                auto dip = parse_ipv4(p.ip_dst);
+                p.udp_checksum_ok = verify_ipv4_l4_checksum(sip, dip, 17, l4_buf, p.udp_len);
+            }
+        } else if (p.has_ipv6) {
+            if (udp_csum_wire == 0) {
+                p.udp_checksum_ok = false; // RFC 8200: zero UDP checksum is invalid in IPv6
+            } else {
+                auto sip6 = parse_ipv6(p.ip_src);
+                auto dip6 = parse_ipv6(p.ip_dst);
+                p.udp_checksum_ok = verify_ipv6_l4_checksum(sip6, dip6, 17, l4_buf, p.udp_len);
+            }
+        }
+
+        p.info = std::to_string(p.udp_srcport) + " -> " + std::to_string(p.udp_dstport) +
+                 " Len=" + std::to_string(p.udp_payload_len);
+
+        const uint8_t* app = l4_buf + 8;
+        size_t alen = p.udp_payload_len;
+        if (p.udp_srcport == 53 || p.udp_dstport == 53 || p.udp_srcport == 5353 ||
+            p.udp_dstport == 5353) {
+            dissect_dns(p, app, alen);
+        } else if (p.udp_srcport == 67 || p.udp_dstport == 67 || p.udp_srcport == 68 ||
+                   p.udp_dstport == 68) {
+            dissect_dhcp(p, app, alen);
+        } else if (p.udp_srcport == 123 || p.udp_dstport == 123) {
+            dissect_ntp(p, app, alen);
+        } else if (p.udp_srcport == 443 || p.udp_dstport == 443 || p.udp_srcport == 4433 ||
+                   p.udp_dstport == 4433 || p.udp_srcport == 8443 || p.udp_dstport == 8443) {
+            dissect_quic(p, app, alen);
+        }
+    }
+}
+
 void dissect_l3_and_above(DissectedPacket& p, uint16_t ethertype, size_t offset) {
     const uint8_t* raw = p.raw.data();
     size_t len = p.raw.size();
 
     if (ethertype == 0x0806) {
-        // ARP
+        // ARP (RFC 826)
         if (offset + 28 > len) return;
         p.has_arp = true;
         p.protocol = "ARP";
@@ -948,9 +1174,10 @@ void dissect_l3_and_above(DissectedPacket& p, uint16_t ethertype, size_t offset)
     size_t ip_payload_end = len;
 
     if (ethertype == 0x0800) {
-        // IPv4
+        // IPv4 (RFC 791)
         if (offset + 20 > len) return;
         uint8_t v_ihl = raw[offset];
+        if (((v_ihl >> 4) & 0x0F) != 4) return;
         uint8_t ihl = static_cast<uint8_t>((v_ihl & 0x0F) * 4);
         if (ihl < 20 || offset + ihl > len) return;
         p.has_ipv4 = true;
@@ -958,24 +1185,35 @@ void dissect_l3_and_above(DissectedPacket& p, uint16_t ethertype, size_t offset)
         p.protocol = "IPv4";
         p.ip_len = read_u16_be(raw + offset + 2);
         p.ip_id = read_u16_be(raw + offset + 4);
+        p.ip_frag_id = p.ip_id;
+        uint16_t frag_word = read_u16_be(raw + offset + 6);
+        p.ip_df = (frag_word & 0x4000) != 0;
+        p.ip_mf = (frag_word & 0x2000) != 0;
+        p.ip_frag_offset = static_cast<uint16_t>((frag_word & 0x1FFF) * 8);
+        p.ip_fragmented = p.ip_mf || (p.ip_frag_offset > 0);
         p.ip_ttl = raw[offset + 8];
         p.ip_proto = raw[offset + 9];
         p.ip_src = format_ipv4(raw + offset + 12);
         p.ip_dst = format_ipv4(raw + offset + 16);
         p.ip_checksum_ok = (ones_complement_checksum(raw + offset, ihl) == 0);
+        if (p.ip_len < ihl) {
+            p.info = "Malformed IPv4 packet (total_length < ihl)";
+            return;
+        }
         l4_offset = offset + ihl;
         l4_proto = p.ip_proto;
-        if (offset + p.ip_len <= len && p.ip_len >= ihl) {
+        if (offset + p.ip_len <= len) {
             ip_payload_end = offset + p.ip_len;
         }
     } else if (ethertype == 0x86DD) {
-        // IPv6
+        // IPv6 (RFC 8200)
         if (offset + 40 > len) return;
+        if (((raw[offset] >> 4) & 0x0F) != 6) return;
         p.has_ipv6 = true;
         p.ip_version = 6;
         p.protocol = "IPv6";
         uint16_t plen = read_u16_be(raw + offset + 4);
-        p.ip_len = static_cast<uint16_t>(40 + plen);
+        p.ip_len = 40u + plen;
         p.ip_proto = raw[offset + 6];
         p.ip_ttl = raw[offset + 7];
         p.ip_src = format_ipv6(raw + offset + 8);
@@ -985,131 +1223,52 @@ void dissect_l3_and_above(DissectedPacket& p, uint16_t ethertype, size_t offset)
         if (l4_offset + plen <= len) {
             ip_payload_end = l4_offset + plen;
         }
+        // Traverse IPv6 extension headers (Hop-by-Hop=0, Routing=43, Fragment=44, DestOpts=60)
+        int ext_hops = 0;
+        while (ext_hops++ < 16 &&
+               (l4_proto == 0 || l4_proto == 43 || l4_proto == 44 || l4_proto == 60)) {
+            if (l4_proto == 44) {
+                if (l4_offset + 8 > ip_payload_end) return;
+                uint8_t next = raw[l4_offset];
+                uint16_t frag_off_m = read_u16_be(raw + l4_offset + 2);
+                uint32_t ident = read_u32_be(raw + l4_offset + 4);
+                p.ip_frag_offset = static_cast<uint16_t>(frag_off_m & 0xFFF8);
+                p.ip_mf = (frag_off_m & 0x0001) != 0;
+                p.ip_fragmented = p.ip_mf || (p.ip_frag_offset > 0);
+                p.ip_frag_id = ident;
+                p.ip_id = static_cast<uint16_t>(ident & 0xFFFF);
+                l4_offset += 8;
+                l4_proto = next;
+                p.ip_proto = l4_proto;
+            } else {
+                if (l4_offset + 2 > ip_payload_end) return;
+                uint8_t next = raw[l4_offset];
+                size_t ext_bytes = (static_cast<size_t>(raw[l4_offset + 1]) + 1) * 8;
+                if (l4_offset + ext_bytes > ip_payload_end) return;
+                l4_offset += ext_bytes;
+                l4_proto = next;
+                p.ip_proto = l4_proto;
+            }
+        }
     } else {
         return;
     }
 
-    if (l4_proto == 1 && p.has_ipv4) {
-        // ICMPv4
-        if (l4_offset + 8 > ip_payload_end) return;
-        p.has_icmp = true;
-        p.protocol = "ICMP";
-        p.icmp_type = raw[l4_offset];
-        p.icmp_code = raw[l4_offset + 1];
-        p.icmp_id = read_u16_be(raw + l4_offset + 4);
-        p.icmp_seq = read_u16_be(raw + l4_offset + 6);
-        if (p.icmp_type == 8) {
-            p.info = "Echo (ping) request id=" + std::to_string(p.icmp_id) +
-                     " seq=" + std::to_string(p.icmp_seq) + " ttl=" + std::to_string(p.ip_ttl);
-        } else if (p.icmp_type == 0) {
-            p.info = "Echo (ping) reply id=" + std::to_string(p.icmp_id) +
-                     " seq=" + std::to_string(p.icmp_seq) + " ttl=" + std::to_string(p.ip_ttl);
-        } else if (p.icmp_type == 11) {
-            p.info = "Time-to-live exceeded in transit";
-        } else if (p.icmp_type == 3) {
-            p.info = "Destination unreachable (code=" + std::to_string(p.icmp_code) + ")";
-        } else {
-            p.info = "ICMP type=" + std::to_string(p.icmp_type) +
-                     " code=" + std::to_string(p.icmp_code);
-        }
-    } else if (l4_proto == 58 && p.has_ipv6) {
-        // ICMPv6
-        if (l4_offset + 8 > ip_payload_end) return;
-        p.has_icmpv6 = true;
-        p.protocol = "ICMPv6";
-        p.icmp_type = raw[l4_offset];
-        p.icmp_code = raw[l4_offset + 1];
-        p.icmp_id = read_u16_be(raw + l4_offset + 4);
-        p.icmp_seq = read_u16_be(raw + l4_offset + 6);
-        if (p.icmp_type == 128) {
-            p.info = "Echo (ping) request v6 id=" + std::to_string(p.icmp_id) +
-                     " seq=" + std::to_string(p.icmp_seq);
-        } else if (p.icmp_type == 129) {
-            p.info = "Echo (ping) reply v6 id=" + std::to_string(p.icmp_id) +
-                     " seq=" + std::to_string(p.icmp_seq);
-        } else if (p.icmp_type == 135 && l4_offset + 24 <= ip_payload_end) {
-            p.info = "Neighbor Solicitation for " + format_ipv6(raw + l4_offset + 8);
-        } else if (p.icmp_type == 136 && l4_offset + 24 <= ip_payload_end) {
-            p.info = "Neighbor Advertisement " + format_ipv6(raw + l4_offset + 8);
-        } else {
-            p.info = "ICMPv6 type=" + std::to_string(p.icmp_type);
-        }
-    } else if (l4_proto == 6) {
-        // TCP
-        if (l4_offset + 20 > ip_payload_end) return;
-        uint8_t doff = static_cast<uint8_t>(((raw[l4_offset + 12] >> 4) & 0x0F) * 4);
-        if (doff < 20 || l4_offset + doff > ip_payload_end) return;
-        p.has_tcp = true;
-        p.protocol = "TCP";
-        p.tcp_srcport = read_u16_be(raw + l4_offset);
-        p.tcp_dstport = read_u16_be(raw + l4_offset + 2);
-        p.tcp_seq = read_u32_be(raw + l4_offset + 4);
-        p.tcp_ack = read_u32_be(raw + l4_offset + 8);
-        p.tcp_flags = raw[l4_offset + 13];
-        p.tcp_window = read_u16_be(raw + l4_offset + 14);
-        p.tcp_hdr_len = doff;
-        p.tcp_payload_offset = static_cast<uint32_t>(l4_offset + doff);
-        p.tcp_payload_len = static_cast<uint32_t>(ip_payload_end - (l4_offset + doff));
-        p.tcp_zero_window = (p.tcp_window == 0 && !p.flag_rst());
+    p.ip_l4_offset = static_cast<uint32_t>(l4_offset);
+    p.ip_l4_len =
+        (ip_payload_end >= l4_offset) ? static_cast<uint32_t>(ip_payload_end - l4_offset) : 0u;
 
-        size_t tcp_seg_len = ip_payload_end - l4_offset;
-        if (p.has_ipv4) {
-            auto sip = parse_ipv4(p.ip_src);
-            auto dip = parse_ipv4(p.ip_dst);
-            p.tcp_checksum_ok = (ipv4_l4_checksum(sip, dip, 6, raw + l4_offset, tcp_seg_len) == 0);
-        } else if (p.has_ipv6) {
-            auto sip6 = parse_ipv6(p.ip_src);
-            auto dip6 = parse_ipv6(p.ip_dst);
-            p.tcp_checksum_ok = (ipv6_l4_checksum(sip6, dip6, 6, raw + l4_offset, tcp_seg_len) == 0);
-        }
-
-        std::ostringstream inf;
-        inf << p.tcp_srcport << " -> " << p.tcp_dstport << " [" << format_tcp_flags(p.tcp_flags)
-            << "] Seq=" << p.tcp_seq << " Ack=" << p.tcp_ack << " Win=" << p.tcp_window
-            << " Len=" << p.tcp_payload_len;
-        p.info = inf.str();
-
-        if (p.tcp_payload_len > 0) {
-            const uint8_t* app = raw + p.tcp_payload_offset;
-            size_t alen = p.tcp_payload_len;
-            dissect_tls(p, app, alen);
-            if (!p.has_tls) {
-                dissect_http(p, app, alen);
-            }
-        }
-    } else if (l4_proto == 17) {
-        // UDP
-        if (l4_offset + 8 > ip_payload_end) return;
-        p.has_udp = true;
-        p.protocol = "UDP";
-        p.udp_srcport = read_u16_be(raw + l4_offset);
-        p.udp_dstport = read_u16_be(raw + l4_offset + 2);
-        p.udp_len = read_u16_be(raw + l4_offset + 4);
-        p.udp_payload_offset = static_cast<uint32_t>(l4_offset + 8);
-        size_t avail = ip_payload_end - (l4_offset + 8);
-        if (p.udp_len >= 8 && static_cast<size_t>(p.udp_len - 8) <= avail) {
-            p.udp_payload_len = p.udp_len - 8;
-        } else {
-            p.udp_payload_len = static_cast<uint32_t>(avail);
-        }
-        p.info = std::to_string(p.udp_srcport) + " -> " + std::to_string(p.udp_dstport) +
-                 " Len=" + std::to_string(p.udp_payload_len);
-
-        const uint8_t* app = raw + p.udp_payload_offset;
-        size_t alen = p.udp_payload_len;
-        if (p.udp_srcport == 53 || p.udp_dstport == 53 || p.udp_srcport == 5353 ||
-            p.udp_dstport == 5353) {
-            dissect_dns(p, app, alen);
-        } else if (p.udp_srcport == 67 || p.udp_dstport == 67 || p.udp_srcport == 68 ||
-                   p.udp_dstport == 68) {
-            dissect_dhcp(p, app, alen);
-        } else if (p.udp_srcport == 123 || p.udp_dstport == 123) {
-            dissect_ntp(p, app, alen);
-        } else if (p.udp_srcport == 443 || p.udp_dstport == 443 || p.udp_srcport == 4433 ||
-                   p.udp_dstport == 4433 || p.udp_srcport == 8443 || p.udp_dstport == 8443) {
-            dissect_quic(p, app, alen);
-        }
+    if (p.ip_fragmented) {
+        std::ostringstream fiss;
+        fiss << (p.has_ipv4 ? "IPv4" : "IPv6") << " fragment (proto="
+             << static_cast<int>(l4_proto) << " id=0x" << std::hex << p.ip_frag_id << std::dec
+             << " off=" << p.ip_frag_offset << " len=" << p.ip_l4_len
+             << (p.ip_mf ? " MF" : " last") << ")";
+        p.info = fiss.str();
+        return;
     }
+
+    dissect_l4_and_above(p, l4_proto, raw + l4_offset, p.ip_l4_len, p.ip_l4_offset);
 }
 
 DissectedPacket dissect_raw_frame(uint32_t number, double ts, const std::vector<uint8_t>& raw,
@@ -1185,10 +1344,63 @@ void Capture::set_vlan(int64_t vlan_id) {
 void Capture::clear_vlan() { default_vlan_id_ = 0; }
 
 void Capture::add_raw_packet(double ts, const std::vector<uint8_t>& raw, uint32_t wire_len,
-                             uint32_t linktype) {
+                             uint32_t linktype, bool defer_analyze) {
+    membudget::require(sizeof(DissectedPacket) + raw.size() + 128);
     uint32_t num = static_cast<uint32_t>(packets_.size() + 1);
     packets_.push_back(dissect_raw_frame(num, ts, raw, wire_len, linktype));
-    analyze();
+    if (!defer_analyze && (packets_.back().has_tcp || packets_.back().ip_fragmented)) {
+        analyze();
+    }
+}
+
+void Capture::raw_frame(double ts, const std::string& hex_bytes, int64_t linktype) {
+    if (linktype != 1 && linktype != 101) {
+        throw std::runtime_error("Unsupported linktype (expected 1=Ethernet or 101=Raw IP): " +
+                                 std::to_string(linktype));
+    }
+    auto bytes = parse_hex_bytes(hex_bytes);
+    add_raw_packet(ts, bytes, static_cast<uint32_t>(bytes.size()),
+                   static_cast<uint32_t>(linktype));
+}
+
+void Capture::ipv4_fragment(double ts, const std::string& src_ip, const std::string& dst_ip,
+                            int64_t proto, int64_t ip_id, int64_t frag_offset_bytes,
+                            bool more_fragments, const std::string& payload_hex) {
+    if (frag_offset_bytes < 0 || frag_offset_bytes > 65528 || (frag_offset_bytes % 8) != 0) {
+        throw std::runtime_error("IPv4 fragment offset must be a multiple of 8 in 0..65528");
+    }
+    auto payload = parse_hex_bytes(payload_hex);
+    uint16_t frag_field = static_cast<uint16_t>((frag_offset_bytes / 8) & 0x1FFF);
+    if (more_fragments) {
+        frag_field |= 0x2000;
+    }
+    std::vector<uint8_t> frame;
+    append_ipv4_packet(frame, default_src_mac_, default_dst_mac_, default_vlan_id_, src_ip, dst_ip,
+                       static_cast<uint8_t>(proto & 0xFF), 64, payload,
+                       static_cast<uint16_t>(ip_id & 0xFFFF), frag_field);
+    add_raw_packet(ts, frame);
+}
+
+void Capture::ipv6_fragment(double ts, const std::string& src_ip6, const std::string& dst_ip6,
+                            int64_t next_hdr, int64_t frag_id, int64_t frag_offset_bytes,
+                            bool more_fragments, const std::string& payload_hex) {
+    if (frag_offset_bytes < 0 || frag_offset_bytes > 65528 || (frag_offset_bytes % 8) != 0) {
+        throw std::runtime_error("IPv6 fragment offset must be a multiple of 8 in 0..65528");
+    }
+    auto payload = parse_hex_bytes(payload_hex);
+    std::vector<uint8_t> frag_hdr_and_body;
+    frag_hdr_and_body.reserve(8 + payload.size());
+    frag_hdr_and_body.push_back(static_cast<uint8_t>(next_hdr & 0xFF));
+    frag_hdr_and_body.push_back(0); // Reserved
+    uint16_t off_m = static_cast<uint16_t>((frag_offset_bytes & 0xFFF8) | (more_fragments ? 1 : 0));
+    push_u16_be(frag_hdr_and_body, off_m);
+    push_u32_be(frag_hdr_and_body, static_cast<uint32_t>(frag_id));
+    frag_hdr_and_body.insert(frag_hdr_and_body.end(), payload.begin(), payload.end());
+
+    std::vector<uint8_t> frame;
+    append_ipv6_packet(frame, default_src_mac_, default_dst_mac_, default_vlan_id_, src_ip6,
+                       dst_ip6, 44, 64, frag_hdr_and_body);
+    add_raw_packet(ts, frame);
 }
 
 void Capture::arp_request(double ts, const std::string& sender_mac, const std::string& sender_ip,
@@ -1409,7 +1621,7 @@ void Capture::icmpv6_neighbor_advert(double ts, const std::string& src_ip6,
 }
 
 static std::vector<uint8_t> build_tcp_segment_bytes(uint16_t src_port, uint16_t dst_port,
-                                                    uint32_t seq, uint32_t ack, uint8_t flags,
+                                                    uint32_t seq, uint32_t ack, uint16_t flags,
                                                     uint16_t window,
                                                     const uint8_t* payload, size_t payload_len) {
     std::vector<uint8_t> tcp;
@@ -1418,8 +1630,8 @@ static std::vector<uint8_t> build_tcp_segment_bytes(uint16_t src_port, uint16_t 
     push_u16_be(tcp, dst_port);
     push_u32_be(tcp, seq);
     push_u32_be(tcp, ack);
-    tcp.push_back(0x50); // Data offset 5 (20 bytes)
-    tcp.push_back(flags);
+    tcp.push_back((flags & 0x100) ? 0x51 : 0x50); // Data offset 5 (20 bytes) + NS bit
+    tcp.push_back(static_cast<uint8_t>(flags & 0xFF));
     push_u16_be(tcp, window);
     push_u16_be(tcp, 0); // Checksum placeholder
     push_u16_be(tcp, 0); // Urgent pointer
@@ -1432,7 +1644,7 @@ static std::vector<uint8_t> build_tcp_segment_bytes(uint16_t src_port, uint16_t 
 void Capture::tcp_segment(double ts, const std::string& src_ip, int64_t src_port,
                           const std::string& dst_ip, int64_t dst_port, int64_t seq, int64_t ack,
                           const std::string& flags, int64_t window, const std::string& payload) {
-    uint8_t f = parse_tcp_flags(flags);
+    uint16_t f = parse_tcp_flags(flags);
     auto tcp = build_tcp_segment_bytes(
         static_cast<uint16_t>(src_port), static_cast<uint16_t>(dst_port),
         static_cast<uint32_t>(seq), static_cast<uint32_t>(ack), f,
@@ -1453,7 +1665,7 @@ void Capture::tcp_segment(double ts, const std::string& src_ip, int64_t src_port
 void Capture::tcp6_segment(double ts, const std::string& src_ip6, int64_t src_port,
                            const std::string& dst_ip6, int64_t dst_port, int64_t seq, int64_t ack,
                            const std::string& flags, int64_t window, const std::string& payload) {
-    uint8_t f = parse_tcp_flags(flags);
+    uint16_t f = parse_tcp_flags(flags);
     auto tcp = build_tcp_segment_bytes(
         static_cast<uint16_t>(src_port), static_cast<uint16_t>(dst_port),
         static_cast<uint32_t>(seq), static_cast<uint32_t>(ack), f,
@@ -1951,7 +2163,7 @@ TcpEndpointKey make_canonical_tcp_key(const std::string& sip, uint16_t sp, const
 }
 
 struct SentSegRecord {
-    uint32_t expected_ack = 0;
+    uint64_t expected_rel_ack = 0;
     double send_ts = 0.0;
     bool acked = false;
     bool retransmitted = false;
@@ -1959,12 +2171,15 @@ struct SentSegRecord {
 
 struct TcpDirState {
     bool has_isn = false;
+    bool saw_syn = false;
     uint32_t isn = 0;
-    uint32_t max_next_seq = 0;
-    uint32_t last_ack_seen = 0;
+    uint64_t max_next_rel_seq = 0;
+    bool has_last_ack = false;
+    uint64_t last_rel_ack_seen = 0;
     uint32_t last_win_seen = 0;
     int dup_ack_streak = 0;
-    std::vector<std::pair<uint32_t, uint32_t>> sent_ranges;
+    size_t first_unacked_idx = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> sent_ranges;
     std::vector<SentSegRecord> unacked;
 };
 
@@ -1972,25 +2187,119 @@ struct TcpStreamState {
     int32_t stream_id = 0;
     std::string init_ip;
     uint16_t init_port = 0;
+    bool has_explicit_init = false;
     TcpDirState dir[2]; // 0 = initiator->responder, 1 = responder->initiator
+};
+
+struct IpFragKey {
+    uint8_t version = 4;
+    std::string src;
+    std::string dst;
+    uint8_t proto = 0;
+    uint32_t id = 0;
+
+    bool operator<(const IpFragKey& o) const {
+        return std::tie(version, src, dst, proto, id) <
+               std::tie(o.version, o.src, o.dst, o.proto, o.id);
+    }
+};
+
+struct IpFragPiece {
+    uint32_t offset = 0;
+    uint32_t len = 0;
+    bool mf = false;
+    size_t pkt_idx = 0;
+};
+
+struct IpFragChain {
+    std::vector<IpFragPiece> pieces;
+    bool has_final = false;
+    uint32_t total_len = 0;
+    bool invalid = false;
+    bool completed = false;
 };
 
 } // namespace
 
 void Capture::analyze() {
+    // 1. Reassemble complete, contiguous, non-overlapping IPv4 and IPv6 fragment chains
+    std::map<IpFragKey, IpFragChain> frag_chains;
+    for (size_t i = 0; i < packets_.size(); ++i) {
+        auto& p = packets_[i];
+        if (p.ip_reassembled) {
+            p = dissect_raw_frame(static_cast<uint32_t>(i + 1), p.timestamp, p.raw, p.wire_len,
+                                  p.linktype);
+        }
+        p.number = static_cast<uint32_t>(i + 1);
+        if (!p.ip_fragmented) continue;
+
+        IpFragKey fk{p.ip_version, p.ip_src, p.ip_dst, p.ip_proto, p.ip_frag_id};
+        auto& chain = frag_chains[fk];
+        if (chain.completed) continue;
+
+        if (p.ip_l4_len == 0 || p.ip_l4_offset + p.ip_l4_len > p.raw.size() ||
+            p.ip_frag_offset + p.ip_l4_len > 65535u) {
+            chain.invalid = true;
+            continue;
+        }
+        uint32_t start = p.ip_frag_offset;
+        uint32_t end = p.ip_frag_offset + p.ip_l4_len;
+        for (const auto& ex : chain.pieces) {
+            if (start < ex.offset + ex.len && end > ex.offset) {
+                chain.invalid = true;
+                break;
+            }
+        }
+        if (!p.ip_mf) {
+            if (chain.has_final && chain.total_len != end) {
+                chain.invalid = true;
+            }
+            chain.has_final = true;
+            chain.total_len = end;
+        }
+        chain.pieces.push_back({start, p.ip_l4_len, p.ip_mf, i});
+
+        if (!chain.invalid && chain.has_final && chain.total_len > 0) {
+            auto sorted = chain.pieces;
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const IpFragPiece& a, const IpFragPiece& b) { return a.offset < b.offset; });
+            uint32_t cur = 0;
+            bool contiguous = true;
+            for (const auto& pc : sorted) {
+                if (pc.offset != cur) {
+                    contiguous = false;
+                    break;
+                }
+                if (pc.offset + pc.len < chain.total_len && !pc.mf) {
+                    contiguous = false;
+                    break;
+                }
+                cur += pc.len;
+            }
+            if (contiguous && cur == chain.total_len) {
+                chain.completed = true;
+                std::vector<uint8_t> full_l4(chain.total_len);
+                for (const auto& pc : sorted) {
+                    const auto& fp = packets_[pc.pkt_idx];
+                    std::memcpy(full_l4.data() + pc.offset, fp.raw.data() + fp.ip_l4_offset, pc.len);
+                }
+                p.ip_reassembled = true;
+                p.ip_reassembled_len = chain.total_len;
+                p.reassembled_l4 = std::move(full_l4);
+                dissect_l4_and_above(p, p.ip_proto, p.reassembled_l4.data(),
+                                     p.reassembled_l4.size(), 0);
+                p.info += " [Reassembled IPv" + std::to_string(p.ip_version) + " length " +
+                          std::to_string(chain.total_len) + "]";
+            }
+        }
+    }
+
+    // 2. Pre-pass to assign TCP stream IDs and determine initiator (SYN sender or SYN,ACK receiver)
     std::map<TcpEndpointKey, TcpStreamState> streams;
     int32_t next_stream_id = 0;
 
-    for (size_t i = 0; i < packets_.size(); ++i) {
-        auto& p = packets_[i];
-        p.number = static_cast<uint32_t>(i + 1);
-        p.tcp_stream = -1;
-        p.tcp_retransmission = false;
-        p.tcp_out_of_order = false;
-        p.tcp_dup_ack = false;
-        p.tcp_rtt_ms = 0.0;
+    for (const auto& p : packets_) {
         if (!p.has_tcp) continue;
-
         auto key = make_canonical_tcp_key(p.ip_src, p.tcp_srcport, p.ip_dst, p.tcp_dstport);
         auto it = streams.find(key);
         if (it == streams.end()) {
@@ -2001,6 +2310,33 @@ void Capture::analyze() {
             it = streams.emplace(key, std::move(st)).first;
         }
         TcpStreamState& st = it->second;
+        if (!st.has_explicit_init) {
+            if (p.flag_syn() && !p.flag_ack()) {
+                st.init_ip = p.ip_src;
+                st.init_port = p.tcp_srcport;
+                st.has_explicit_init = true;
+            } else if (p.flag_syn() && p.flag_ack()) {
+                st.init_ip = p.ip_dst;
+                st.init_port = p.tcp_dstport;
+                st.has_explicit_init = true;
+            }
+        }
+    }
+
+    // 3. Main TCP sequence/ack/retransmission/OOO/RTT pass in 64-bit relative sequence space
+    for (size_t i = 0; i < packets_.size(); ++i) {
+        auto& p = packets_[i];
+        p.number = static_cast<uint32_t>(i + 1);
+        p.tcp_stream = -1;
+        p.tcp_retransmission = false;
+        p.tcp_out_of_order = false;
+        p.tcp_dup_ack = false;
+        p.tcp_rtt_ms = 0.0;
+        p.tcp_saw_syn = false;
+        if (!p.has_tcp) continue;
+
+        auto key = make_canonical_tcp_key(p.ip_src, p.tcp_srcport, p.ip_dst, p.tcp_dstport);
+        TcpStreamState& st = streams[key];
         p.tcp_stream = st.stream_id;
         bool from_init = (p.ip_src == st.init_ip && p.tcp_srcport == st.init_port);
         p.tcp_from_initiator = from_init;
@@ -2010,53 +2346,78 @@ void Capture::analyze() {
         TcpDirState& my_dir = st.dir[d];
         TcpDirState& other_dir = st.dir[opp];
 
-        if (!my_dir.has_isn) {
+        if (!my_dir.has_isn || (p.flag_syn() && !my_dir.saw_syn)) {
             my_dir.has_isn = true;
             my_dir.isn = p.tcp_seq;
-            my_dir.max_next_seq = p.tcp_seq;
+            if (p.flag_syn()) {
+                my_dir.saw_syn = true;
+            }
         }
-        p.tcp_rel_seq = p.tcp_seq - my_dir.isn;
-        p.tcp_rel_ack = other_dir.has_isn ? (p.tcp_ack - other_dir.isn) : 0;
+        p.tcp_saw_syn = my_dir.saw_syn;
+        uint32_t rel_seq_u32 = p.tcp_seq - my_dir.isn;
+        uint32_t rel_ack_u32 = other_dir.has_isn ? (p.tcp_ack - other_dir.isn) : 0;
+        p.tcp_rel_seq = rel_seq_u32;
+        p.tcp_rel_ack = rel_ack_u32;
 
-        uint32_t seg_advance = p.tcp_payload_len;
+        uint64_t seg_advance = p.tcp_payload_len;
         if (p.flag_syn()) seg_advance += 1;
         if (p.flag_fin()) seg_advance += 1;
 
+        uint64_t rel_start = static_cast<uint64_t>(rel_seq_u32);
+        uint64_t rel_end = rel_start + seg_advance;
+
         if (seg_advance > 0) {
-            uint32_t s_start = p.tcp_seq;
-            uint32_t s_end = p.tcp_seq + seg_advance;
             bool overlaps = false;
-            for (const auto& r : my_dir.sent_ranges) {
-                if (s_start < r.second && s_end > r.first) {
-                    overlaps = true;
-                    break;
+            if (!my_dir.sent_ranges.empty() && rel_start == my_dir.sent_ranges.back().second) {
+                // Fast path: in-order contiguous segment
+                my_dir.sent_ranges.back().second = rel_end;
+            } else {
+                for (const auto& r : my_dir.sent_ranges) {
+                    if (rel_start < r.second && rel_end > r.first) {
+                        overlaps = true;
+                        break;
+                    }
                 }
+                my_dir.sent_ranges.push_back({rel_start, rel_end});
+                std::sort(my_dir.sent_ranges.begin(), my_dir.sent_ranges.end());
+                std::vector<std::pair<uint64_t, uint64_t>> merged;
+                merged.reserve(my_dir.sent_ranges.size());
+                for (const auto& r : my_dir.sent_ranges) {
+                    if (!merged.empty() && r.first <= merged.back().second) {
+                        merged.back().second = std::max(merged.back().second, r.second);
+                    } else {
+                        merged.push_back(r);
+                    }
+                }
+                my_dir.sent_ranges.swap(merged);
             }
+
             if (overlaps) {
                 p.tcp_retransmission = true;
-                for (auto& u : my_dir.unacked) {
-                    if (u.expected_ack == s_end) {
-                        u.retransmitted = true;
+                for (size_t ui = my_dir.first_unacked_idx; ui < my_dir.unacked.size(); ++ui) {
+                    if (my_dir.unacked[ui].expected_rel_ack == rel_end) {
+                        my_dir.unacked[ui].retransmitted = true;
                     }
                 }
                 if (p.info.find("[TCP Retransmission]") == std::string::npos) {
                     p.info = "[TCP Retransmission] " + p.info;
                 }
-            } else if (s_start < my_dir.max_next_seq) {
+            } else if (rel_start < my_dir.max_next_rel_seq) {
                 p.tcp_out_of_order = true;
                 if (p.info.find("[TCP Out-Of-Order]") == std::string::npos) {
                     p.info = "[TCP Out-Of-Order] " + p.info;
                 }
             }
-            my_dir.sent_ranges.push_back({s_start, s_end});
-            if (s_end > my_dir.max_next_seq) {
-                my_dir.max_next_seq = s_end;
+            if (rel_end > my_dir.max_next_rel_seq) {
+                my_dir.max_next_rel_seq = rel_end;
             }
-            my_dir.unacked.push_back({s_end, p.timestamp, false, p.tcp_retransmission});
+            my_dir.unacked.push_back({rel_end, p.timestamp, false, p.tcp_retransmission});
         } else if (p.flag_ack() && !p.flag_syn() && !p.flag_fin() && !p.flag_rst()) {
-            // Pure ACK: check duplicate ACK
-            if (my_dir.last_ack_seen == p.tcp_ack && my_dir.last_win_seen == p.tcp_window &&
-                other_dir.has_isn && p.tcp_ack < other_dir.max_next_seq) {
+            // Pure ACK: check duplicate ACK in relative sequence space
+            uint64_t rel_ack_64 = static_cast<uint64_t>(rel_ack_u32);
+            if (my_dir.has_last_ack && my_dir.last_rel_ack_seen == rel_ack_64 &&
+                my_dir.last_win_seen == p.tcp_window && other_dir.has_isn &&
+                rel_ack_64 < other_dir.max_next_rel_seq) {
                 my_dir.dup_ack_streak += 1;
                 p.tcp_dup_ack = true;
                 if (p.info.find("[TCP Dup ACK]") == std::string::npos) {
@@ -2065,20 +2426,27 @@ void Capture::analyze() {
             } else {
                 my_dir.dup_ack_streak = 0;
             }
-            my_dir.last_ack_seen = p.tcp_ack;
+            my_dir.has_last_ack = true;
+            my_dir.last_rel_ack_seen = rel_ack_64;
             my_dir.last_win_seen = p.tcp_window;
         }
 
         // RTT calculation when ACK acknowledges opposite direction's sent segment(s)
-        if (p.flag_ack()) {
+        if (p.flag_ack() && other_dir.has_isn) {
+            uint64_t rel_ack_64 = static_cast<uint64_t>(rel_ack_u32);
             double measured_rtt_ms = 0.0;
-            for (auto& u : other_dir.unacked) {
-                if (!u.acked && p.tcp_ack >= u.expected_ack) {
+            for (size_t ui = other_dir.first_unacked_idx; ui < other_dir.unacked.size(); ++ui) {
+                auto& u = other_dir.unacked[ui];
+                if (!u.acked && rel_ack_64 >= u.expected_rel_ack) {
                     u.acked = true;
                     if (!u.retransmitted && p.timestamp >= u.send_ts) {
                         measured_rtt_ms = (p.timestamp - u.send_ts) * 1000.0;
                     }
                 }
+            }
+            while (other_dir.first_unacked_idx < other_dir.unacked.size() &&
+                   other_dir.unacked[other_dir.first_unacked_idx].acked) {
+                ++other_dir.first_unacked_idx;
             }
             p.tcp_rtt_ms = measured_rtt_ms;
         }
@@ -2306,6 +2674,7 @@ static const DissectedPacket& get_pkt_checked(const std::vector<DissectedPacket>
 
 double Capture::pkt_time(int64_t idx) const { return get_pkt_checked(packets_, idx).timestamp; }
 int64_t Capture::pkt_len(int64_t idx) const { return get_pkt_checked(packets_, idx).wire_len; }
+int64_t Capture::pkt_linktype(int64_t idx) const { return get_pkt_checked(packets_, idx).linktype; }
 std::string Capture::pkt_proto(int64_t idx) const { return get_pkt_checked(packets_, idx).protocol; }
 
 std::string Capture::pkt_src(int64_t idx) const {
@@ -2343,26 +2712,60 @@ static std::string extract_packet_field(const DissectedPacket& p, const std::str
     std::string f = to_lower(trim(field_raw));
     if (f == "frame.number" || f == "no") return std::to_string(p.number);
     if (f == "frame.len" || f == "length") return std::to_string(p.wire_len);
+    if (f == "frame.cap_len") return std::to_string(p.cap_len);
     if (f == "frame.time" || f == "time") return std::to_string(p.timestamp);
     if (f == "frame.protocols" || f == "protocol") return p.protocol;
-    if (f == "eth.src") return p.eth_src;
-    if (f == "eth.dst") return p.eth_dst;
-    if (f == "vlan.id") return p.has_vlan ? std::to_string(p.vlan_id) : "0";
+    if (f == "frame.linktype") return std::to_string(p.linktype);
+    if (f == "eth.src") return p.has_eth ? p.eth_src : "";
+    if (f == "eth.dst") return p.has_eth ? p.eth_dst : "";
+    if (f == "eth.type") return p.has_eth ? std::to_string(p.eth_type) : "";
+    if (f == "vlan.id") return p.has_vlan ? std::to_string(p.vlan_id) : "";
     if (f == "arp.opcode") return p.has_arp ? std::to_string(p.arp_opcode) : "";
-    if (f == "arp.src.proto_ipv4" || f == "arp.sender_ip") return p.arp_sender_ip;
-    if (f == "arp.dst.proto_ipv4" || f == "arp.target_ip") return p.arp_target_ip;
-    if (f == "ip.src" || f == "ipv6.src") return p.ip_src;
-    if (f == "ip.dst" || f == "ipv6.dst") return p.ip_dst;
-    if (f == "ip.ttl" || f == "ipv6.hlim") return std::to_string(p.ip_ttl);
-    if (f == "ip.proto") return std::to_string(p.ip_proto);
-    if (f == "ip.version") return std::to_string(p.ip_version);
-    if (f == "ip.checksum_ok") return p.ip_checksum_ok ? "true" : "false";
+    if (f == "arp.src.proto_ipv4" || f == "arp.sender_ip")
+        return p.has_arp ? p.arp_sender_ip : "";
+    if (f == "arp.dst.proto_ipv4" || f == "arp.target_ip")
+        return p.has_arp ? p.arp_target_ip : "";
+    if (f == "arp.src.hw_mac" || f == "arp.sender_mac")
+        return p.has_arp ? p.arp_sender_mac : "";
+    if (f == "arp.dst.hw_mac" || f == "arp.target_mac")
+        return p.has_arp ? p.arp_target_mac : "";
+    if (f == "ip.src") return (p.has_ipv4 || p.has_ipv6) ? p.ip_src : "";
+    if (f == "ip.dst") return (p.has_ipv4 || p.has_ipv6) ? p.ip_dst : "";
+    if (f == "ipv6.src") return p.has_ipv6 ? p.ip_src : "";
+    if (f == "ipv6.dst") return p.has_ipv6 ? p.ip_dst : "";
+    if (f == "ip.ttl") return (p.has_ipv4 || p.has_ipv6) ? std::to_string(p.ip_ttl) : "";
+    if (f == "ipv6.hlim") return p.has_ipv6 ? std::to_string(p.ip_ttl) : "";
+    if (f == "ip.proto") return (p.has_ipv4 || p.has_ipv6) ? std::to_string(p.ip_proto) : "";
+    if (f == "ip.version") return (p.has_ipv4 || p.has_ipv6) ? std::to_string(p.ip_version) : "";
+    if (f == "ip.len") return (p.has_ipv4 || p.has_ipv6) ? std::to_string(p.ip_len) : "";
+    if (f == "ip.id") return p.has_ipv4 ? std::to_string(p.ip_frag_id) : "";
+    if (f == "ipv6.frag_id")
+        return (p.has_ipv6 && (p.ip_fragmented || p.ip_reassembled))
+                   ? std::to_string(p.ip_frag_id)
+                   : "";
+    if (f == "ip.checksum_ok") return p.has_ipv4 ? (p.ip_checksum_ok ? "true" : "false") : "";
+    if (f == "ip.fragmented") return p.has_ipv4 ? (p.ip_fragmented ? "true" : "false") : "";
+    if (f == "ipv6.fragmented") return p.has_ipv6 ? (p.ip_fragmented ? "true" : "false") : "";
+    if (f == "ip.frag_offset") return p.has_ipv4 ? std::to_string(p.ip_frag_offset) : "";
+    if (f == "ipv6.frag_offset") return p.has_ipv6 ? std::to_string(p.ip_frag_offset) : "";
+    if (f == "ip.flags.df") return p.has_ipv4 ? (p.ip_df ? "1" : "0") : "";
+    if (f == "ip.flags.mf") return p.has_ipv4 ? (p.ip_mf ? "1" : "0") : "";
+    if (f == "ipv6.flags.mf") return p.has_ipv6 ? (p.ip_mf ? "1" : "0") : "";
+    if (f == "ip.reassembled") return p.has_ipv4 ? (p.ip_reassembled ? "true" : "false") : "";
+    if (f == "ipv6.reassembled") return p.has_ipv6 ? (p.ip_reassembled ? "true" : "false") : "";
+    if (f == "ip.reassembled_len")
+        return (p.has_ipv4 && p.ip_reassembled) ? std::to_string(p.ip_reassembled_len) : "";
+    if (f == "ipv6.reassembled_len")
+        return (p.has_ipv6 && p.ip_reassembled) ? std::to_string(p.ip_reassembled_len) : "";
     if (f == "icmp.type" || f == "icmpv6.type")
         return (p.has_icmp || p.has_icmpv6) ? std::to_string(p.icmp_type) : "";
     if (f == "icmp.code" || f == "icmpv6.code")
         return (p.has_icmp || p.has_icmpv6) ? std::to_string(p.icmp_code) : "";
     if (f == "icmp.seq" || f == "icmpv6.seq")
         return (p.has_icmp || p.has_icmpv6) ? std::to_string(p.icmp_seq) : "";
+    if (f == "icmp.checksum_ok") return p.has_icmp ? (p.icmp_checksum_ok ? "true" : "false") : "";
+    if (f == "icmpv6.checksum_ok")
+        return p.has_icmpv6 ? (p.icmp_checksum_ok ? "true" : "false") : "";
     if (f == "tcp.srcport") return p.has_tcp ? std::to_string(p.tcp_srcport) : "";
     if (f == "tcp.dstport") return p.has_tcp ? std::to_string(p.tcp_dstport) : "";
     if (f == "tcp.seq") return p.has_tcp ? std::to_string(p.tcp_seq) : "";
@@ -2372,20 +2775,36 @@ static std::string extract_packet_field(const DissectedPacket& p, const std::str
     if (f == "tcp.window" || f == "tcp.window_size")
         return p.has_tcp ? std::to_string(p.tcp_window) : "";
     if (f == "tcp.len") return p.has_tcp ? std::to_string(p.tcp_payload_len) : "";
-    if (f == "tcp.stream") return p.has_tcp ? std::to_string(p.tcp_stream) : "-1";
+    if (f == "tcp.stream") return p.has_tcp ? std::to_string(p.tcp_stream) : "";
     if (f == "tcp.flags") return p.has_tcp ? format_tcp_flags(p.tcp_flags) : "";
-    if (f == "tcp.checksum_ok") return p.tcp_checksum_ok ? "true" : "false";
+    if (f == "tcp.flags.fin") return p.has_tcp ? (p.flag_fin() ? "1" : "0") : "";
+    if (f == "tcp.flags.syn") return p.has_tcp ? (p.flag_syn() ? "1" : "0") : "";
+    if (f == "tcp.flags.rst") return p.has_tcp ? (p.flag_rst() ? "1" : "0") : "";
+    if (f == "tcp.flags.psh") return p.has_tcp ? (p.flag_psh() ? "1" : "0") : "";
+    if (f == "tcp.flags.ack") return p.has_tcp ? (p.flag_ack() ? "1" : "0") : "";
+    if (f == "tcp.flags.urg") return p.has_tcp ? (p.flag_urg() ? "1" : "0") : "";
+    if (f == "tcp.flags.ece") return p.has_tcp ? (p.flag_ece() ? "1" : "0") : "";
+    if (f == "tcp.flags.cwr") return p.has_tcp ? (p.flag_cwr() ? "1" : "0") : "";
+    if (f == "tcp.flags.ns") return p.has_tcp ? (p.flag_ns() ? "1" : "0") : "";
+    if (f == "tcp.checksum_ok") return p.has_tcp ? (p.tcp_checksum_ok ? "true" : "false") : "";
     if (f == "tcp.rtt_ms" || f == "tcp.analysis.ack_rtt") {
+        if (!p.has_tcp) return "";
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(3) << p.tcp_rtt_ms;
         return oss.str();
     }
-    if (f == "tcp.analysis.retransmission") return p.tcp_retransmission ? "true" : "false";
-    if (f == "tcp.analysis.out_of_order") return p.tcp_out_of_order ? "true" : "false";
-    if (f == "tcp.analysis.duplicate_ack") return p.tcp_dup_ack ? "true" : "false";
+    if (f == "tcp.analysis.retransmission")
+        return p.has_tcp ? (p.tcp_retransmission ? "true" : "false") : "";
+    if (f == "tcp.analysis.out_of_order")
+        return p.has_tcp ? (p.tcp_out_of_order ? "true" : "false") : "";
+    if (f == "tcp.analysis.duplicate_ack")
+        return p.has_tcp ? (p.tcp_dup_ack ? "true" : "false") : "";
+    if (f == "tcp.analysis.zero_window")
+        return p.has_tcp ? (p.tcp_zero_window ? "true" : "false") : "";
     if (f == "udp.srcport") return p.has_udp ? std::to_string(p.udp_srcport) : "";
     if (f == "udp.dstport") return p.has_udp ? std::to_string(p.udp_dstport) : "";
     if (f == "udp.length") return p.has_udp ? std::to_string(p.udp_len) : "";
+    if (f == "udp.checksum_ok") return p.has_udp ? (p.udp_checksum_ok ? "true" : "false") : "";
     if (f == "dns.qname" || f == "dns.qry.name") return p.dns_qname;
     if (f == "dns.qtype" || f == "dns.qry.type") return p.dns_qtype;
     if (f == "dns.answer" || f == "dns.a" || f == "dns.aaaa") return p.dns_answer;
@@ -2421,8 +2840,8 @@ std::string Capture::pkt_field(int64_t idx, const std::string& field) const {
     return extract_packet_field(get_pkt_checked(packets_, idx), field);
 }
 
-static std::string reassemble_direction(const std::vector<DissectedPacket>& packets,
-                                        int64_t stream_id, bool from_initiator) {
+static std::map<uint32_t, uint8_t> build_direction_byte_map(
+    const std::vector<DissectedPacket>& packets, int64_t stream_id, bool from_initiator) {
     std::map<uint32_t, uint8_t> byte_map;
     for (const auto& p : packets) {
         if (!p.has_tcp || p.tcp_stream != stream_id || p.tcp_from_initiator != from_initiator) {
@@ -2430,23 +2849,44 @@ static std::string reassemble_direction(const std::vector<DissectedPacket>& pack
         }
         if (p.tcp_payload_len == 0) continue;
         uint32_t base_rel = p.tcp_rel_seq;
-        // If SYN was on the same segment or earlier, data offset starts at 1 after SYN
-        if (base_rel > 0 && !p.flag_syn()) {
+        // Subtract 1 for SYN only when a SYN was actually seen on this direction
+        if (p.tcp_saw_syn && !p.flag_syn() && base_rel > 0) {
             base_rel -= 1;
         }
+        const auto& src_buf = !p.reassembled_l4.empty() ? p.reassembled_l4 : p.raw;
         for (uint32_t i = 0; i < p.tcp_payload_len; ++i) {
+            if (p.tcp_payload_offset + i >= src_buf.size()) break;
             uint32_t pos = base_rel + i;
             if (byte_map.find(pos) == byte_map.end()) {
-                byte_map[pos] = p.raw[p.tcp_payload_offset + i];
+                byte_map[pos] = src_buf[p.tcp_payload_offset + i];
             }
         }
     }
+    return byte_map;
+}
+
+static std::string reassemble_direction(const std::vector<DissectedPacket>& packets,
+                                        int64_t stream_id, bool from_initiator) {
+    auto byte_map = build_direction_byte_map(packets, stream_id, from_initiator);
+    if (byte_map.empty()) return "";
     std::string out;
     out.reserve(byte_map.size());
+    uint32_t expected_pos = 0;
     for (const auto& kv : byte_map) {
+        if (kv.first > expected_pos) {
+            uint32_t gap = kv.first - expected_pos;
+            out += "[<" + std::to_string(gap) + " bytes missing>]";
+        }
         out.push_back(static_cast<char>(kv.second));
+        expected_pos = kv.first + 1;
     }
     return out;
+}
+
+static int64_t reassemble_direction_bytes(const std::vector<DissectedPacket>& packets,
+                                          int64_t stream_id, bool from_initiator) {
+    return static_cast<int64_t>(
+        build_direction_byte_map(packets, stream_id, from_initiator).size());
 }
 
 std::string Capture::tcp_stream_text(int64_t stream_id, const std::string& direction) const {
@@ -2462,7 +2902,15 @@ std::string Capture::tcp_stream_text(int64_t stream_id, const std::string& direc
 }
 
 int64_t Capture::tcp_stream_bytes(int64_t stream_id, const std::string& direction) const {
-    return static_cast<int64_t>(tcp_stream_text(stream_id, direction).size());
+    std::string d = to_lower(trim(direction));
+    if (d == "client" || d == "c2s" || d == "request") {
+        return reassemble_direction_bytes(packets_, stream_id, true);
+    }
+    if (d == "server" || d == "s2c" || d == "response") {
+        return reassemble_direction_bytes(packets_, stream_id, false);
+    }
+    return reassemble_direction_bytes(packets_, stream_id, true) +
+           reassemble_direction_bytes(packets_, stream_id, false);
 }
 
 int64_t Capture::tcp_stream_packets(int64_t stream_id) const {
@@ -2586,7 +3034,8 @@ std::vector<FilterToken> tokenize_filter(const std::string& expr) {
     return toks;
 }
 
-bool compare_single_value(const std::string& lhs, const std::string& op, const std::string& rhs) {
+bool compare_single_value(const std::string& lhs, const std::string& op, const std::string& rhs,
+                          bool case_insensitive = false) {
     if (lhs.empty() && op != "!=") return false;
     if (op == "contains") {
         return to_lower(lhs).find(to_lower(rhs)) != std::string::npos;
@@ -2605,8 +3054,8 @@ bool compare_single_value(const std::string& lhs, const std::string& op, const s
         if (op == ">") return nl > nr;
         if (op == ">=") return nl >= nr;
     }
-    std::string ll = to_lower(lhs);
-    std::string rl = to_lower(rhs);
+    std::string ll = case_insensitive ? to_lower(lhs) : lhs;
+    std::string rl = case_insensitive ? to_lower(rhs) : rhs;
     if (op == "==") return ll == rl;
     if (op == "!=") return ll != rl;
     if (op == "<") return ll < rl;
@@ -2621,17 +3070,28 @@ bool eval_display_atom(const DissectedPacket& p, const std::string& field_raw,
     std::string f = to_lower(trim(field_raw));
     if (op.empty()) {
         // Bare protocol or boolean flag
-        if (f == "tcp.flags.syn") return p.has_tcp && p.flag_syn();
-        if (f == "tcp.flags.ack") return p.has_tcp && p.flag_ack();
         if (f == "tcp.flags.fin") return p.has_tcp && p.flag_fin();
+        if (f == "tcp.flags.syn") return p.has_tcp && p.flag_syn();
         if (f == "tcp.flags.rst") return p.has_tcp && p.flag_rst();
         if (f == "tcp.flags.psh") return p.has_tcp && p.flag_psh();
-        if (f == "tcp.analysis.retransmission") return p.tcp_retransmission;
-        if (f == "tcp.analysis.out_of_order") return p.tcp_out_of_order;
-        if (f == "tcp.analysis.duplicate_ack") return p.tcp_dup_ack;
-        if (f == "tcp.analysis.zero_window") return p.tcp_zero_window;
-        if (f == "dns.qry.name" || f == "dns.qname") return !p.dns_qname.empty();
-        if (f == "tls.sni") return !p.tls_sni.empty();
+        if (f == "tcp.flags.ack") return p.has_tcp && p.flag_ack();
+        if (f == "tcp.flags.urg") return p.has_tcp && p.flag_urg();
+        if (f == "tcp.flags.ece") return p.has_tcp && p.flag_ece();
+        if (f == "tcp.flags.cwr") return p.has_tcp && p.flag_cwr();
+        if (f == "tcp.flags.ns") return p.has_tcp && p.flag_ns();
+        if (f == "ip.fragmented") return p.has_ipv4 && p.ip_fragmented;
+        if (f == "ipv6.fragmented") return p.has_ipv6 && p.ip_fragmented;
+        if (f == "ip.reassembled") return p.has_ipv4 && p.ip_reassembled;
+        if (f == "ipv6.reassembled") return p.has_ipv6 && p.ip_reassembled;
+        if (f == "ip.flags.df") return p.has_ipv4 && p.ip_df;
+        if (f == "ip.flags.mf") return p.has_ipv4 && p.ip_mf;
+        if (f == "ipv6.flags.mf") return p.has_ipv6 && p.ip_mf;
+        if (f == "tcp.analysis.retransmission") return p.has_tcp && p.tcp_retransmission;
+        if (f == "tcp.analysis.out_of_order") return p.has_tcp && p.tcp_out_of_order;
+        if (f == "tcp.analysis.duplicate_ack") return p.has_tcp && p.tcp_dup_ack;
+        if (f == "tcp.analysis.zero_window") return p.has_tcp && p.tcp_zero_window;
+        if (f == "dns.qry.name" || f == "dns.qname") return p.has_dns && !p.dns_qname.empty();
+        if (f == "tls.sni") return p.has_tls && !p.tls_sni.empty();
         if (packet_matches_protocol(p, to_upper(f))) return true;
         std::string val = extract_packet_field(p, f);
         return !val.empty() && val != "0" && val != "false" && val != "-1";
@@ -2643,8 +3103,10 @@ bool eval_display_atom(const DissectedPacket& p, const std::string& field_raw,
         if (!p.ip_src.empty()) candidates.push_back(p.ip_src);
         if (!p.ip_dst.empty()) candidates.push_back(p.ip_dst);
     } else if (f == "eth.addr") {
-        if (!p.eth_src.empty()) candidates.push_back(p.eth_src);
-        if (!p.eth_dst.empty()) candidates.push_back(p.eth_dst);
+        if (p.has_eth) {
+            if (!p.eth_src.empty()) candidates.push_back(p.eth_src);
+            if (!p.eth_dst.empty()) candidates.push_back(p.eth_dst);
+        }
     } else if (f == "tcp.port") {
         if (p.has_tcp) {
             candidates.push_back(std::to_string(p.tcp_srcport));
@@ -2655,14 +3117,6 @@ bool eval_display_atom(const DissectedPacket& p, const std::string& field_raw,
             candidates.push_back(std::to_string(p.udp_srcport));
             candidates.push_back(std::to_string(p.udp_dstport));
         }
-    } else if (f == "tcp.flags.syn") {
-        candidates.push_back((p.has_tcp && p.flag_syn()) ? "1" : "0");
-    } else if (f == "tcp.flags.ack") {
-        candidates.push_back((p.has_tcp && p.flag_ack()) ? "1" : "0");
-    } else if (f == "tcp.flags.fin") {
-        candidates.push_back((p.has_tcp && p.flag_fin()) ? "1" : "0");
-    } else if (f == "tcp.flags.rst") {
-        candidates.push_back((p.has_tcp && p.flag_rst()) ? "1" : "0");
     } else {
         std::string val = extract_packet_field(p, f);
         if (!val.empty()) candidates.push_back(val);
@@ -2670,18 +3124,27 @@ bool eval_display_atom(const DissectedPacket& p, const std::string& field_raw,
 
     if (candidates.empty()) return false;
     std::string norm_rhs = rhs;
-    if (f.find("tcp.flags.") == 0) {
+    if (f.find("tcp.flags.") == 0 || f == "ip.flags.df" || f == "ip.flags.mf" ||
+        f == "ipv6.flags.mf") {
         if (to_lower(rhs) == "true") norm_rhs = "1";
         if (to_lower(rhs) == "false") norm_rhs = "0";
+    } else if (f == "ip.checksum_ok" || f == "tcp.checksum_ok" || f == "udp.checksum_ok" ||
+               f == "icmp.checksum_ok" || f == "icmpv6.checksum_ok" || f == "ip.fragmented" ||
+               f == "ipv6.fragmented" || f == "ip.reassembled" || f == "ipv6.reassembled" ||
+               f.find("tcp.analysis.") == 0) {
+        if (rhs == "1" || to_lower(rhs) == "true") norm_rhs = "true";
+        if (rhs == "0" || to_lower(rhs) == "false") norm_rhs = "false";
     }
+    bool ci = (f == "frame.protocols" || f == "protocol" || f == "eth.src" || f == "eth.dst" ||
+               f == "eth.addr" || f == "ipv6.src" || f == "ipv6.dst" || f == "ipv6.addr");
     if (op == "!=") {
         for (const auto& c : candidates) {
-            if (!compare_single_value(c, "!=", norm_rhs)) return false;
+            if (!compare_single_value(c, "!=", norm_rhs, ci)) return false;
         }
         return true;
     }
     for (const auto& c : candidates) {
-        if (compare_single_value(c, op, norm_rhs)) return true;
+        if (compare_single_value(c, op, norm_rhs, ci)) return true;
     }
     return false;
 }
@@ -2956,6 +3419,11 @@ private:
 
 Capture Capture::filter(const std::string& expr) const {
     auto toks = tokenize_filter(expr);
+    if (packets_.empty()) {
+        DissectedPacket dummy;
+        DisplayFilterParser parser(toks, dummy);
+        (void)parser.parse();
+    }
     Capture out;
     out.default_src_mac_ = default_src_mac_;
     out.default_dst_mac_ = default_dst_mac_;
@@ -2971,6 +3439,11 @@ Capture Capture::filter(const std::string& expr) const {
 
 Capture Capture::bpf(const std::string& expr) const {
     auto toks = tokenize_filter(expr);
+    if (packets_.empty()) {
+        DissectedPacket dummy;
+        BpfFilterParser parser(toks, dummy);
+        (void)parser.parse();
+    }
     Capture out;
     out.default_src_mac_ = default_src_mac_;
     out.default_dst_mac_ = default_dst_mac_;
@@ -3023,12 +3496,20 @@ void Capture::save_pcap(const std::string& path) const {
                   << "\n";
         return;
     }
+    uint32_t linktype = packets_.empty() ? 1u : packets_.front().linktype;
+    for (const auto& p : packets_) {
+        if (p.linktype != linktype) {
+            throw std::runtime_error(
+                "Cannot save capture with mixed link types (" + std::to_string(linktype) +
+                " and " + std::to_string(p.linktype) +
+                ") to classic PCAP format; use save_pcapng() instead");
+        }
+    }
     ensure_parent_dir(path);
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) {
         throw std::runtime_error("Failed to open pcap for writing: " + path);
     }
-    uint32_t linktype = packets_.empty() ? 1u : packets_.front().linktype;
     write_u32_le(ofs, 0xa1b2c3d4u); // Microsecond pcap magic
     write_u16_le(ofs, 2);           // Major version 2
     write_u16_le(ofs, 4);           // Minor version 4
@@ -3055,6 +3536,7 @@ void Capture::save_pcap(const std::string& path) const {
                       static_cast<std::streamsize>(p.raw.size()));
         }
     }
+    finish_output_stream(ofs, path);
 }
 
 void Capture::save_pcapng(const std::string& path) const {
@@ -3079,15 +3561,29 @@ void Capture::save_pcapng(const std::string& path) const {
     write_u32_le(ofs, 0xFFFFFFFFu);
     write_u32_le(ofs, 28);
 
-    // 2. Interface Description Block (IDB: 0x00000001, 20 bytes)
-    uint16_t linktype =
-        packets_.empty() ? static_cast<uint16_t>(1) : static_cast<uint16_t>(packets_.front().linktype);
-    write_u32_le(ofs, 0x00000001u);
-    write_u32_le(ofs, 20);
-    write_u16_le(ofs, linktype);
-    write_u16_le(ofs, 0);
-    write_u32_le(ofs, 65535); // SnapLen
-    write_u32_le(ofs, 20);
+    // 2. Interface Description Blocks (IDB: 0x00000001, 20 bytes) — one per distinct linktype
+    std::vector<uint16_t> linktypes;
+    std::map<uint16_t, uint32_t> lt_to_ifid;
+    for (const auto& p : packets_) {
+        uint16_t lt = static_cast<uint16_t>(p.linktype);
+        if (lt_to_ifid.find(lt) == lt_to_ifid.end()) {
+            uint32_t id = static_cast<uint32_t>(linktypes.size());
+            lt_to_ifid[lt] = id;
+            linktypes.push_back(lt);
+        }
+    }
+    if (linktypes.empty()) {
+        linktypes.push_back(1);
+        lt_to_ifid[1] = 0;
+    }
+    for (uint16_t lt : linktypes) {
+        write_u32_le(ofs, 0x00000001u);
+        write_u32_le(ofs, 20);
+        write_u16_le(ofs, lt);
+        write_u16_le(ofs, 0);
+        write_u32_le(ofs, 65535); // SnapLen
+        write_u32_le(ofs, 20);
+    }
 
     // 3. Enhanced Packet Blocks (EPB: 0x00000006)
     for (const auto& p : packets_) {
@@ -3095,6 +3591,7 @@ void Capture::save_pcapng(const std::string& path) const {
         uint32_t orig_len = p.wire_len > 0 ? p.wire_len : cap_len;
         uint32_t pad_len = (4u - (cap_len % 4u)) % 4u;
         uint32_t block_len = 32u + cap_len + pad_len;
+        uint32_t if_id = lt_to_ifid[static_cast<uint16_t>(p.linktype)];
 
         uint64_t ts_us =
             static_cast<uint64_t>(std::llround(std::max(0.0, p.timestamp) * 1000000.0));
@@ -3103,7 +3600,7 @@ void Capture::save_pcapng(const std::string& path) const {
 
         write_u32_le(ofs, 0x00000006u);
         write_u32_le(ofs, block_len);
-        write_u32_le(ofs, 0); // Interface ID 0
+        write_u32_le(ofs, if_id);
         write_u32_le(ofs, ts_high);
         write_u32_le(ofs, ts_low);
         write_u32_le(ofs, cap_len);
@@ -3118,6 +3615,7 @@ void Capture::save_pcapng(const std::string& path) const {
         }
         write_u32_le(ofs, block_len);
     }
+    finish_output_stream(ofs, path);
 }
 
 static std::string csv_escape(const std::string& s) {
@@ -3170,6 +3668,7 @@ void Capture::save_packets_csv(const std::string& path) const {
             << p.tcp_stream << "," << (p.tcp_retransmission ? 1 : 0) << "," << std::setprecision(3)
             << p.tcp_rtt_ms << std::setprecision(6) << "," << csv_escape(p.info) << "\n";
     }
+    finish_output_stream(ofs, path);
 }
 
 void Capture::save_flows_csv(const std::string& path) const {
@@ -3195,6 +3694,7 @@ void Capture::save_flows_csv(const std::string& path) const {
             << f.bytes_b2a << "," << tpkts << "," << tbytes << "," << dur << "," << f.retrans
             << "," << rtt << "\n";
     }
+    finish_output_stream(ofs, path);
 }
 
 void Capture::save_top_talkers_csv(const std::string& path) const {
@@ -3250,6 +3750,7 @@ void Capture::save_top_talkers_csv(const std::string& path) const {
             << t.rx_pkts << "," << t.rx_bytes << "," << (t.tx_pkts + t.rx_pkts) << ","
             << (t.tx_bytes + t.rx_bytes) << "," << t.peers.size() << "\n";
     }
+    finish_output_stream(ofs, path);
 }
 
 void Capture::save_protocol_hierarchy_csv(const std::string& path) const {
@@ -3286,6 +3787,7 @@ void Capture::save_protocol_hierarchy_csv(const std::string& path) const {
         ofs << std::get<0>(r) << "," << std::get<1>(r) << "," << std::get<2>(r) << "," << pp << ","
             << pb << "\n";
     }
+    finish_output_stream(ofs, path);
 }
 
 void Capture::save_io_graph_csv(double bucket_sec, const std::string& path) const {
@@ -3302,7 +3804,10 @@ void Capture::save_io_graph_csv(double bucket_sec, const std::string& path) cons
 
     ofs << "time,total_pkts,total_bytes,total_mbps,tcp_bytes,udp_bytes,icmp_bytes,dns_bytes,"
            "http_bytes,tls_bytes,quic_bytes,retrans_pkts\n";
-    if (packets_.empty()) return;
+    if (packets_.empty()) {
+        finish_output_stream(ofs, path);
+        return;
+    }
 
     double tmin = packets_.front().timestamp;
     double tmax = packets_.front().timestamp;
@@ -3353,6 +3858,7 @@ void Capture::save_io_graph_csv(double bucket_sec, const std::string& path) cons
             << "," << bk.http_bytes << "," << bk.tls_bytes << "," << bk.quic_bytes << ","
             << bk.retrans_pkts << "\n";
     }
+    finish_output_stream(ofs, path);
 }
 
 void Capture::save_time_sequence_csv(int64_t stream_id, const std::string& path) const {
@@ -3374,6 +3880,7 @@ void Capture::save_time_sequence_csv(int64_t stream_id, const std::string& path)
             << std::setprecision(3) << p.tcp_rtt_ms << std::setprecision(6) << ","
             << csv_escape(format_tcp_flags(p.tcp_flags)) << "\n";
     }
+    finish_output_stream(ofs, path);
 }
 
 void Capture::save_json(const std::string& path) const {
@@ -3408,6 +3915,7 @@ void Capture::save_json(const std::string& path) const {
         ofs << "\n";
     }
     ofs << "  ]\n}\n";
+    finish_output_stream(ofs, path);
 }
 
 std::string Capture::summary() const {
@@ -3425,14 +3933,19 @@ std::string Capture::summary() const {
 Capture Shark::capture() const { return Capture(); }
 
 Capture Shark::open(const std::string& path) const {
-    std::ifstream ifs(path, std::ios::binary);
+    std::ifstream ifs(path, std::ios::binary | std::ios::ate);
     if (!ifs) {
         throw std::runtime_error("Cannot open capture file: " + path);
     }
-    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(ifs)),
-                             std::istreambuf_iterator<char>());
-    if (buf.size() < 24) {
+    std::streamoff file_sz = ifs.tellg();
+    if (file_sz < 24) {
         throw std::runtime_error("Capture file too small (< 24 bytes): " + path);
+    }
+    membudget::require(static_cast<size_t>(file_sz));
+    ifs.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buf(static_cast<size_t>(file_sz));
+    if (!ifs.read(reinterpret_cast<char*>(buf.data()), file_sz)) {
+        throw std::runtime_error("Failed to read capture file: " + path);
     }
 
     Capture cap;
@@ -3461,7 +3974,23 @@ Capture Shark::open(const std::string& path) const {
     }
 
     if (is_pcap) {
+        uint16_t ver_major = read_u16_endian(buf.data() + 4, big_endian);
+        uint16_t ver_minor = read_u16_endian(buf.data() + 6, big_endian);
+        if (ver_major != 2 || ver_minor != 4) {
+            throw std::runtime_error("Unsupported pcap version " + std::to_string(ver_major) + "." +
+                                     std::to_string(ver_minor) + " (expected 2.4): " + path);
+        }
+        uint32_t snaplen = read_u32_endian(buf.data() + 16, big_endian);
+        if (snaplen == 0 || snaplen > 67108864u) {
+            throw std::runtime_error("Invalid pcap snaplen (" + std::to_string(snaplen) +
+                                     "): " + path);
+        }
         uint32_t linktype = read_u32_endian(buf.data() + 20, big_endian);
+        if (linktype != 1u && linktype != 101u) {
+            throw std::runtime_error("Unsupported pcap linktype (" + std::to_string(linktype) +
+                                     ", expected 1=Ethernet or 101=Raw IP): " + path);
+        }
+
         size_t off = 24;
         while (off + 16 <= buf.size()) {
             uint32_t ts_sec = read_u32_endian(buf.data() + off, big_endian);
@@ -3469,31 +3998,55 @@ Capture Shark::open(const std::string& path) const {
             uint32_t incl_len = read_u32_endian(buf.data() + off + 8, big_endian);
             uint32_t orig_len = read_u32_endian(buf.data() + off + 12, big_endian);
             off += 16;
-            if (off + incl_len > buf.size()) {
+
+            uint32_t max_sub = nanosecond ? 1000000000u : 1000000u;
+            if (ts_sub >= max_sub) {
+                throw std::runtime_error("Invalid pcap subsecond timestamp (" +
+                                         std::to_string(ts_sub) + "): " + path);
+            }
+            if (incl_len > snaplen) {
+                throw std::runtime_error("Packet incl_len (" + std::to_string(incl_len) +
+                                         ") exceeds pcap snaplen (" + std::to_string(snaplen) +
+                                         "): " + path);
+            }
+            if (incl_len > orig_len) {
+                throw std::runtime_error("Packet incl_len (" + std::to_string(incl_len) +
+                                         ") exceeds orig_len (" + std::to_string(orig_len) +
+                                         "): " + path);
+            }
+            if (incl_len > buf.size() - off) {
                 throw std::runtime_error("Truncated packet record in pcap file: " + path);
             }
+            membudget::require(incl_len);
             double ts = static_cast<double>(ts_sec) +
                         static_cast<double>(ts_sub) / (nanosecond ? 1e9 : 1e6);
             std::vector<uint8_t> raw(buf.begin() + off, buf.begin() + off + incl_len);
-            uint32_t num = static_cast<uint32_t>(cap.packets().size() + 1);
-            cap.add_raw_packet(ts, raw, orig_len, linktype);
-            (void)num;
+            cap.add_raw_packet(ts, raw, orig_len, linktype, true);
             off += incl_len;
         }
+        if (off != buf.size()) {
+            throw std::runtime_error("Trailing partial packet record header in pcap file: " + path);
+        }
+        cap.analyze();
         return cap;
     }
 
     // Check pcapng Section Header Block (0x0A0D0D0A)
     if (magic_le == 0x0A0D0D0Au) {
         bool ng_big_endian = false;
+        bool has_shb = false;
         std::vector<uint32_t> iface_linktypes;
+        std::vector<uint32_t> iface_snaplens;
         std::vector<double> iface_ts_resol;
+        std::vector<double> iface_ts_offset;
         size_t off = 0;
 
         while (off + 12 <= buf.size()) {
-            uint32_t btype = read_u32_endian(buf.data() + off, ng_big_endian);
-            if (btype == 0x0A0D0D0Au) {
-                if (off + 12 > buf.size()) break;
+            uint32_t raw_btype_le = read_u32_le(buf.data() + off);
+            if (raw_btype_le == 0x0A0D0D0Au) {
+                if (buf.size() - off < 28) {
+                    throw std::runtime_error("Truncated pcapng Section Header Block in: " + path);
+                }
                 uint32_t bom = read_u32_le(buf.data() + off + 8);
                 if (bom == 0x1A2B3C4Du) {
                     ng_big_endian = false;
@@ -3502,68 +4055,195 @@ Capture Shark::open(const std::string& path) const {
                 } else {
                     throw std::runtime_error("Invalid pcapng byte-order magic in: " + path);
                 }
+                has_shb = true;
                 iface_linktypes.clear();
+                iface_snaplens.clear();
                 iface_ts_resol.clear();
-            }
-            uint32_t blen = read_u32_endian(buf.data() + off + 4, ng_big_endian);
-            if (blen < 12 || off + blen > buf.size()) {
-                throw std::runtime_error("Invalid or truncated pcapng block in: " + path);
+                iface_ts_offset.clear();
+            } else if (!has_shb) {
+                throw std::runtime_error("Missing initial Section Header Block in pcapng: " + path);
             }
 
-            if (btype == 0x00000001u && blen >= 20) {
+            uint32_t btype = read_u32_endian(buf.data() + off, ng_big_endian);
+            uint32_t blen = read_u32_endian(buf.data() + off + 4, ng_big_endian);
+            if (blen < 12u || (blen % 4u) != 0u || blen > buf.size() - off) {
+                throw std::runtime_error("Invalid or truncated pcapng block length (" +
+                                         std::to_string(blen) + ") in: " + path);
+            }
+            uint32_t trailer_len = read_u32_endian(buf.data() + off + blen - 4, ng_big_endian);
+            if (trailer_len != blen) {
+                throw std::runtime_error("Mismatched pcapng block trailing length (" +
+                                         std::to_string(trailer_len) + " != " +
+                                         std::to_string(blen) + ") in: " + path);
+            }
+
+            if (btype == 0x0A0D0D0Au) {
+                if (blen < 28u) {
+                    throw std::runtime_error("Invalid SHB length (< 28) in pcapng: " + path);
+                }
+                uint16_t v_maj = read_u16_endian(buf.data() + off + 12, ng_big_endian);
+                uint16_t v_min = read_u16_endian(buf.data() + off + 14, ng_big_endian);
+                if (v_maj != 1 || v_min != 0) {
+                    throw std::runtime_error("Unsupported pcapng version " + std::to_string(v_maj) +
+                                             "." + std::to_string(v_min) + " in: " + path);
+                }
+                int64_t sec_len =
+                    static_cast<int64_t>(read_u64_endian(buf.data() + off + 16, ng_big_endian));
+                if (sec_len != -1) {
+                    if (sec_len < 0 || (sec_len % 4) != 0 ||
+                        static_cast<uint64_t>(sec_len) > buf.size() - off - blen) {
+                        throw std::runtime_error("Invalid pcapng SHB section_length in: " + path);
+                    }
+                }
+            } else if (btype == 0x00000001u) {
                 // Interface Description Block (IDB)
+                if (blen < 20u) {
+                    throw std::runtime_error("Invalid IDB length (< 20) in pcapng: " + path);
+                }
                 uint16_t lt = read_u16_endian(buf.data() + off + 8, ng_big_endian);
+                if (lt != 1u && lt != 101u) {
+                    throw std::runtime_error("Unsupported pcapng IDB linktype (" +
+                                             std::to_string(lt) + ") in: " + path);
+                }
+                uint32_t snap = read_u32_endian(buf.data() + off + 12, ng_big_endian);
+                if (snap == 0 || snap > 67108864u) {
+                    throw std::runtime_error("Invalid pcapng IDB snaplen (" + std::to_string(snap) +
+                                             ") in: " + path);
+                }
                 double resol = 1e-6;
-                // Parse optional if_tsresol (option code 9)
+                double tsoffset = 0.0;
+                // Parse options: if_tsresol (code 9), if_tsoffset (code 14)
                 size_t opt_off = off + 16;
                 size_t opt_end = off + blen - 4;
                 while (opt_off + 4 <= opt_end) {
                     uint16_t ocode = read_u16_endian(buf.data() + opt_off, ng_big_endian);
                     uint16_t olen = read_u16_endian(buf.data() + opt_off + 2, ng_big_endian);
                     opt_off += 4;
-                    if (ocode == 0 || opt_off + olen > opt_end) break;
-                    if (ocode == 9 && olen >= 1) {
-                        uint8_t r = buf[opt_off];
-                        if ((r & 0x80) == 0) {
-                            resol = std::pow(10.0, -static_cast<int>(r & 0x7F));
-                        } else {
-                            resol = std::pow(2.0, -static_cast<int>(r & 0x7F));
+                    if (ocode == 0) {
+                        if (olen != 0) {
+                            throw std::runtime_error("Invalid non-zero opt_endofopt length in: " +
+                                                     path);
                         }
+                        break;
                     }
-                    opt_off += olen + ((4u - (olen % 4u)) % 4u);
+                    size_t padded_olen =
+                        static_cast<size_t>(olen) + ((4u - (olen % 4u)) % 4u);
+                    if (opt_off + padded_olen > opt_end) {
+                        throw std::runtime_error("Malformed IDB option length in pcapng: " + path);
+                    }
+                    if (ocode == 9) {
+                        if (olen != 1) {
+                            throw std::runtime_error("Invalid if_tsresol option length in: " +
+                                                     path);
+                        }
+                        uint8_t r = buf[opt_off];
+                        uint8_t exp = static_cast<uint8_t>(r & 0x7F);
+                        if ((r & 0x80) == 0) {
+                            if (exp > 18) {
+                                throw std::runtime_error("Invalid decimal if_tsresol exponent in: " +
+                                                         path);
+                            }
+                            resol = std::pow(10.0, -static_cast<int>(exp));
+                        } else {
+                            if (exp > 64) {
+                                throw std::runtime_error("Invalid binary if_tsresol exponent in: " +
+                                                         path);
+                            }
+                            resol = std::pow(2.0, -static_cast<int>(exp));
+                        }
+                    } else if (ocode == 14) {
+                        if (olen != 8) {
+                            throw std::runtime_error("Invalid if_tsoffset option length in: " +
+                                                     path);
+                        }
+                        int64_t off_sec = static_cast<int64_t>(
+                            read_u64_endian(buf.data() + opt_off, ng_big_endian));
+                        tsoffset = static_cast<double>(off_sec);
+                    }
+                    opt_off += padded_olen;
                 }
                 iface_linktypes.push_back(lt);
+                iface_snaplens.push_back(snap);
                 iface_ts_resol.push_back(resol);
-            } else if (btype == 0x00000006u && blen >= 32) {
+                iface_ts_offset.push_back(tsoffset);
+            } else if (btype == 0x00000006u) {
                 // Enhanced Packet Block (EPB)
+                if (blen < 32u) {
+                    throw std::runtime_error("Invalid EPB length (< 32) in pcapng: " + path);
+                }
                 uint32_t if_id = read_u32_endian(buf.data() + off + 8, ng_big_endian);
+                if (if_id >= iface_linktypes.size()) {
+                    throw std::runtime_error("EPB references undefined interface_id (" +
+                                             std::to_string(if_id) + ") in pcapng: " + path);
+                }
                 uint32_t ts_high = read_u32_endian(buf.data() + off + 12, ng_big_endian);
                 uint32_t ts_low = read_u32_endian(buf.data() + off + 16, ng_big_endian);
                 uint32_t cap_len = read_u32_endian(buf.data() + off + 20, ng_big_endian);
                 uint32_t orig_len = read_u32_endian(buf.data() + off + 24, ng_big_endian);
-                if (28u + cap_len + 4u > blen) {
-                    throw std::runtime_error("Corrupt EPB packet length in pcapng: " + path);
+
+                // Safe subtraction prevents 32-bit overflow when cap_len is near UINT32_MAX
+                uint32_t max_body = blen - 32u;
+                uint32_t pad_len = (4u - (cap_len % 4u)) % 4u;
+                if (cap_len > max_body || pad_len > max_body - cap_len) {
+                    throw std::runtime_error("Corrupt EPB packet captured length in pcapng: " +
+                                             path);
                 }
+                uint32_t snap = iface_snaplens[if_id];
+                if (cap_len > snap) {
+                    throw std::runtime_error("EPB cap_len (" + std::to_string(cap_len) +
+                                             ") exceeds interface snaplen (" +
+                                             std::to_string(snap) + ") in: " + path);
+                }
+                if (cap_len > orig_len) {
+                    throw std::runtime_error("EPB cap_len (" + std::to_string(cap_len) +
+                                             ") exceeds orig_len (" + std::to_string(orig_len) +
+                                             ") in: " + path);
+                }
+                if (cap_len > buf.size() - (off + 28u)) {
+                    throw std::runtime_error("EPB packet data exceeds file bounds in: " + path);
+                }
+                membudget::require(cap_len);
+
                 uint64_t ts64 = (static_cast<uint64_t>(ts_high) << 32) | ts_low;
-                double resol =
-                    (if_id < iface_ts_resol.size()) ? iface_ts_resol[if_id] : 1e-6;
-                uint32_t lt =
-                    (if_id < iface_linktypes.size()) ? iface_linktypes[if_id] : 1u;
-                double ts = static_cast<double>(ts64) * resol;
+                double resol = iface_ts_resol[if_id];
+                double tsoff = iface_ts_offset[if_id];
+                uint32_t lt = iface_linktypes[if_id];
+                double ts = static_cast<double>(ts64) * resol + tsoff;
                 std::vector<uint8_t> raw(buf.begin() + off + 28,
                                          buf.begin() + off + 28 + cap_len);
-                cap.add_raw_packet(ts, raw, orig_len, lt);
-            } else if (btype == 0x00000003u && blen >= 16) {
+                cap.add_raw_packet(ts, raw, orig_len, lt, true);
+            } else if (btype == 0x00000003u) {
                 // Simple Packet Block (SPB)
+                if (blen < 16u) {
+                    throw std::runtime_error("Invalid SPB length (< 16) in pcapng: " + path);
+                }
+                if (iface_linktypes.empty()) {
+                    throw std::runtime_error("SPB appears before any IDB in pcapng: " + path);
+                }
                 uint32_t orig_len = read_u32_endian(buf.data() + off + 8, ng_big_endian);
-                uint32_t cap_len = std::min<uint32_t>(orig_len, blen - 16u);
-                uint32_t lt = iface_linktypes.empty() ? 1u : iface_linktypes[0];
+                uint32_t snap = iface_snaplens[0];
+                uint32_t cap_len = (snap > 0) ? std::min<uint32_t>(orig_len, snap) : orig_len;
+                uint32_t max_body = blen - 16u;
+                uint32_t pad_len = (4u - (cap_len % 4u)) % 4u;
+                if (cap_len > max_body || pad_len > max_body - cap_len ||
+                    cap_len + pad_len != max_body) {
+                    throw std::runtime_error("Corrupt SPB packet length in pcapng: " + path);
+                }
+                if (cap_len > buf.size() - (off + 12u)) {
+                    throw std::runtime_error("SPB packet data exceeds file bounds in: " + path);
+                }
+                membudget::require(cap_len);
+                uint32_t lt = iface_linktypes[0];
                 std::vector<uint8_t> raw(buf.begin() + off + 12,
                                          buf.begin() + off + 12 + cap_len);
-                cap.add_raw_packet(0.0, raw, orig_len, lt);
+                cap.add_raw_packet(0.0, raw, orig_len, lt, true);
             }
             off += blen;
         }
+        if (off != buf.size()) {
+            throw std::runtime_error("Trailing partial block header in pcapng file: " + path);
+        }
+        cap.analyze();
         return cap;
     }
 

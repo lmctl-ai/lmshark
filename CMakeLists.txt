@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(lmshark VERSION 0.1.0 LANGUAGES C CXX)
+project(lmshark VERSION 0.1.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,11 +25,11 @@ file(WRITE "${GEN}/schema_embedded.hpp" "#pragma once\n#include <cstddef>\nnames
 embed_file(NOTICES_SRC "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES" embedded_notices)
 file(WRITE "${GEN}/notices_embedded.hpp" "#pragma once\n#include <cstddef>\nnamespace lmshark { ${NOTICES_SRC} }\n")
 
-add_library(shark_core STATIC cpp/shark.cpp)
+add_library(shark_core STATIC cpp/shark.cpp cpp/memory_budget.cpp)
 target_include_directories(shark_core PUBLIC cpp)
 target_compile_options(shark_core PRIVATE -Wall -Wextra -Wpedantic)
 
-add_executable(lmshark cpp/main.cpp cpp/memory_budget.cpp)
+add_executable(lmshark cpp/main.cpp)
 target_include_directories(lmshark PRIVATE cpp "${GEN}")
 target_compile_definitions(lmshark PRIVATE LMSHARK_VERSION="${PROJECT_VERSION}")
 target_link_libraries(lmshark PRIVATE shark_core)
@@ -51,7 +51,7 @@ static_executable(lmshark)
 
 include(CTest)
 if(BUILD_TESTING)
-  add_executable(core_tests tests/core.cpp cpp/memory_budget.cpp)
+  add_executable(core_tests tests/core.cpp)
   target_link_libraries(core_tests PRIVATE shark_core)
   target_compile_options(core_tests PRIVATE -Wall -Wextra -Wpedantic)
   static_executable(core_tests)

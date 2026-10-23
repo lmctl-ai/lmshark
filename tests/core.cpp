@@ -244,6 +244,304 @@ void test_binary_format_variants() {
     CHECK(raw_cap.pkt_src(0) == "10.0.0.1");
 }
 
+void test_tcp_edge_cases_and_ecn_flags() {
+    lmshark::Shark shark;
+
+    // 1. Capture starting with SYN,ACK from server (initiator must be SYN,ACK receiver)
+    {
+        lmshark::Capture c = shark.capture();
+        c.tcp_segment(0.000, "10.0.0.2", 80, "10.0.0.1", 40000, 5001, 1000, "SYN,ACK", 65535, "");
+        c.tcp_segment(0.001, "10.0.0.1", 40000, "10.0.0.2", 80, 1000, 5002, "SYN", 65535, "");
+        c.tcp_segment(0.002, "10.0.0.1", 40000, "10.0.0.2", 80, 1001, 5002, "PSH,ACK", 65535,
+                      "HELLO");
+        CHECK(c.packets()[0].tcp_from_initiator == false);
+        CHECK(c.packets()[1].tcp_from_initiator == true);
+        CHECK(c.packets()[2].tcp_from_initiator == true);
+        CHECK(c.tcp_stream_text(0, "client") == "HELLO");
+        CHECK(c.tcp_stream_text(0, "server") == "");
+        CHECK_NEAR(c.packets()[2].tcp_rtt_ms, 2.0, 1e-3);
+    }
+
+    // 2. 32-bit sequence number wrap-around (0xfffffffa -> 0 -> 5)
+    {
+        lmshark::Capture c = shark.capture();
+        c.tcp_segment(0.000, "10.0.0.1", 40000, "10.0.0.2", 80, 4294967290LL, 0, "SYN", 65535, "");
+        c.tcp_segment(0.005, "10.0.0.2", 80, "10.0.0.1", 40000, 2000, 4294967291LL, "SYN,ACK",
+                      65535, "");
+        c.tcp_segment(0.010, "10.0.0.1", 40000, "10.0.0.2", 80, 4294967291LL, 2001, "ACK", 65535,
+                      "");
+        c.tcp_segment(0.020, "10.0.0.1", 40000, "10.0.0.2", 80, 4294967291LL, 2001, "PSH,ACK",
+                      65535, "ABCDE");
+        c.tcp_segment(0.030, "10.0.0.1", 40000, "10.0.0.2", 80, 0, 2001, "PSH,ACK", 65535,
+                      "FGHIJ");
+        c.tcp_segment(0.045, "10.0.0.2", 80, "10.0.0.1", 40000, 2001, 5, "ACK", 65535, "");
+        CHECK(c.out_of_order_count() == 0);
+        CHECK(c.retransmission_count() == 0);
+        CHECK(c.tcp_stream_text(0, "client") == "ABCDEFGHIJ");
+        CHECK(c.tcp_stream_bytes(0, "client") == 10);
+        CHECK_NEAR(c.packets()[5].tcp_rtt_ms, 15.0, 1e-3);
+    }
+
+    // 3. Midstream TCP reassembly without SYN (must not clip first byte of second segment)
+    {
+        lmshark::Capture c = shark.capture();
+        c.tcp_segment(0.000, "10.0.0.1", 40000, "10.0.0.2", 80, 500, 900, "PSH,ACK", 65535, "AB");
+        c.tcp_segment(0.001, "10.0.0.1", 40000, "10.0.0.2", 80, 502, 900, "PSH,ACK", 65535, "CDEF");
+        CHECK(c.tcp_stream_text(0, "client") == "ABCDEF");
+        CHECK(c.tcp_stream_bytes(0, "client") == 6);
+    }
+
+    // 4. Unrecovered TCP sequence gap marker in tcp_stream_text
+    {
+        lmshark::Capture c = shark.capture();
+        c.tcp_segment(0.000, "10.0.0.1", 40000, "10.0.0.2", 80, 1000, 0, "SYN", 65535, "");
+        c.tcp_segment(0.001, "10.0.0.1", 40000, "10.0.0.2", 80, 1001, 0, "PSH,ACK", 65535, "AB");
+        c.tcp_segment(0.002, "10.0.0.1", 40000, "10.0.0.2", 80, 1005, 0, "PSH,ACK", 65535, "EF");
+        CHECK(c.tcp_stream_text(0, "client") == "AB[<2 bytes missing>]EF");
+        CHECK(c.tcp_stream_bytes(0, "client") == 4);
+    }
+
+    // 5. ECN/CWR/NS flags, L4 checksums, and display filter precision
+    {
+        lmshark::Capture c = shark.capture();
+        c.udp_datagram(0.000, "10.0.0.1", 53, "10.0.0.2", 9999, "DNS");
+        c.tcp_segment(0.001, "10.0.0.1", 40000, "10.0.0.2", 80, 100, 0, "SYN,ECE,CWR,NS", 65535,
+                      "");
+        c.http_request(0.002, "10.0.0.1", 40001, "10.0.0.2", 80, 100, 0, "GET", "/Admin",
+                       "example.test", "");
+
+        CHECK(c.pkt_field(0, "tcp.checksum_ok") == "");
+        CHECK(c.pkt_field(0, "udp.checksum_ok") == "true");
+        CHECK(c.pkt_field(1, "tcp.checksum_ok") == "true");
+        CHECK(c.pkt_field(1, "tcp.flags") == "SYN,ECE,CWR,NS");
+        CHECK(c.pkt_field(1, "tcp.flags.ece") == "1");
+        CHECK(c.pkt_field(1, "tcp.flags.cwr") == "1");
+        CHECK(c.pkt_field(1, "tcp.flags.ns") == "1");
+
+        CHECK(c.filter("tcp.flags.syn == 0").packet_count() == 1);
+        CHECK(c.filter("tcp.stream == -1").packet_count() == 0);
+        CHECK(c.filter("tcp.checksum_ok").packet_count() == 2);
+        CHECK(c.filter("http.uri == \"/admin\"").packet_count() == 0);
+        CHECK(c.filter("http.uri == \"/Admin\"").packet_count() == 1);
+    }
+}
+
+void test_ipv4_and_ipv6_fragmentation_and_reassembly() {
+    lmshark::Shark shark;
+
+    // 1. Complete 2-fragment IPv4 UDP datagram (8-byte UDP header + "hello!" = 14 bytes)
+    // UDP header: src=1234 (0x04d2), dst=53 (0x0035), len=14 (0x000e), checksum=0 (0x0000)
+    // Payload: "hello!" (68656c6c6f21)
+    {
+        lmshark::Capture c = shark.capture();
+        c.ipv4_fragment(0.001, "10.0.0.1", "10.0.0.2", 17, 0x1234, 0, true, "04d20035000e0000");
+        CHECK(c.pkt_proto(0) == "IPv4");
+        CHECK(c.pkt_field(0, "ip.fragmented") == "true");
+        CHECK(c.pkt_field(0, "ip.flags.mf") == "1");
+        CHECK(c.pkt_field(0, "ip.frag_offset") == "0");
+        CHECK(c.pkt_srcport(0) == 0);
+
+        c.ipv4_fragment(0.002, "10.0.0.1", "10.0.0.2", 17, 0x1234, 8, false, "68656c6c6f21");
+        CHECK(c.pkt_proto(1) == "UDP");
+        CHECK(c.pkt_field(1, "ip.fragmented") == "true");
+        CHECK(c.pkt_field(1, "ip.reassembled") == "true");
+        CHECK(c.pkt_field(1, "ip.reassembled_len") == "14");
+        CHECK(c.pkt_srcport(1) == 1234);
+        CHECK(c.pkt_dstport(1) == 53);
+    }
+
+    // 2. Non-initial IPv4 fragment alone must NOT be dissected as L4
+    {
+        lmshark::Capture c = shark.capture();
+        c.ipv4_fragment(0.001, "10.0.0.1", "10.0.0.2", 6, 0x2222, 8, false,
+                        "04d2005000000001000000005002200000000000");
+        CHECK(c.pkt_proto(0) == "IPv4");
+        CHECK(c.pkt_field(0, "ip.fragmented") == "true");
+        CHECK(c.pkt_field(0, "ip.reassembled") == "false");
+        CHECK(c.pkt_srcport(0) == 0);
+    }
+
+    // 3. Overlapping IPv4 fragments must be rejected from reassembly
+    {
+        lmshark::Capture c = shark.capture();
+        c.ipv4_fragment(0.001, "10.0.0.1", "10.0.0.2", 17, 0x3333, 0, true,
+                        "04d20035001000004141414141414141");
+        c.ipv4_fragment(0.002, "10.0.0.1", "10.0.0.2", 17, 0x3333, 8, false,
+                        "4242424242424242");
+        CHECK(c.pkt_proto(0) == "IPv4");
+        CHECK(c.pkt_proto(1) == "IPv4");
+        CHECK(c.pkt_field(1, "ip.reassembled") == "false");
+    }
+
+    // 4. IPv6 Fragment Header (Next Header = 44) reassembly
+    {
+        lmshark::Capture c = shark.capture();
+        c.ipv6_fragment(0.001, "2001:db8::1", "2001:db8::2", 17, 0xfeedbeef, 0, true,
+                        "04d20035000e0000");
+        CHECK(c.pkt_proto(0) == "IPv6");
+        CHECK(c.pkt_field(0, "ipv6.fragmented") == "true");
+        c.ipv6_fragment(0.002, "2001:db8::1", "2001:db8::2", 17, 0xfeedbeef, 8, false,
+                        "68656c6c6f21");
+        CHECK(c.pkt_proto(1) == "UDP");
+        CHECK(c.pkt_field(1, "ipv6.reassembled") == "true");
+        CHECK(c.pkt_field(1, "ipv6.reassembled_len") == "14");
+        CHECK(c.pkt_srcport(1) == 1234);
+        CHECK(c.pkt_dstport(1) == 53);
+    }
+}
+
+void test_mixed_linktypes_and_dev_full() {
+    lmshark::Shark shark;
+    lmshark::Capture c = shark.capture();
+    c.udp_datagram(0.001, "10.0.0.1", 12345, "10.0.0.2", 54321, "eth_pkt");
+    // Extract raw IPv4 bytes from packet 0 and add as LINKTYPE_RAW (101)
+    std::vector<uint8_t> raw_ip(c.packets()[0].raw.begin() + 14, c.packets()[0].raw.end());
+    c.add_raw_packet(0.002, raw_ip, static_cast<uint32_t>(raw_ip.size()), 101);
+
+    CHECK(c.pkt_linktype(0) == 1);
+    CHECK(c.pkt_linktype(1) == 101);
+
+    // Classic PCAP must reject mixed link types
+    std::string bad_pcap = "/tmp/lmshark_mixed_reject.pcap";
+    bool threw_mixed = false;
+    try {
+        c.save_pcap(bad_pcap);
+    } catch (const std::runtime_error&) {
+        threw_mixed = true;
+    }
+    CHECK(threw_mixed);
+    std::filesystem::remove(bad_pcap);
+
+    // PCAPNG must preserve both link types across save/open roundtrip
+    std::string mixed_ng = "/tmp/lmshark_mixed_roundtrip.pcapng";
+    c.save_pcapng(mixed_ng);
+    lmshark::Capture reopened = shark.open(mixed_ng);
+    CHECK(reopened.packet_count() == 2);
+    CHECK(reopened.pkt_linktype(0) == 1);
+    CHECK(reopened.pkt_linktype(1) == 101);
+    CHECK(reopened.pkt_proto(0) == "UDP");
+    CHECK(reopened.pkt_proto(1) == "UDP");
+    CHECK(reopened.pkt_src(0) == "10.0.0.1");
+    CHECK(reopened.pkt_src(1) == "10.0.0.1");
+    std::filesystem::remove(mixed_ng);
+
+#ifdef __linux__
+    if (std::filesystem::exists("/dev/full")) {
+        lmshark::Capture single = shark.capture();
+        single.udp_datagram(0.001, "10.0.0.1", 1234, "10.0.0.2", 80, "test");
+        auto expect_io_err = [](auto&& fn) {
+            bool threw = false;
+            try {
+                fn();
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            CHECK(threw);
+        };
+        expect_io_err([&] { single.save_pcap("/dev/full"); });
+        expect_io_err([&] { single.save_pcapng("/dev/full"); });
+        expect_io_err([&] { single.save_packets_csv("/dev/full"); });
+        expect_io_err([&] { single.save_flows_csv("/dev/full"); });
+        expect_io_err([&] { single.save_top_talkers_csv("/dev/full"); });
+        expect_io_err([&] { single.save_protocol_hierarchy_csv("/dev/full"); });
+        expect_io_err([&] { single.save_io_graph_csv(1.0, "/dev/full"); });
+        expect_io_err([&] { single.save_time_sequence_csv(0, "/dev/full"); });
+        expect_io_err([&] { single.save_json("/dev/full"); });
+    }
+#endif
+}
+
+void test_malformed_captures_and_robustness() {
+    lmshark::Shark shark;
+    auto write_temp = [](const std::vector<uint8_t>& bytes) {
+        std::string p = "/tmp/lmshark_malformed_test.bin";
+        std::ofstream ofs(p, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+        return p;
+    };
+    auto expect_open_throws = [&](const std::vector<uint8_t>& bytes) {
+        std::string p = write_temp(bytes);
+        bool threw = false;
+        try {
+            (void)shark.open(p);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        std::filesystem::remove(p);
+        CHECK(threw);
+    };
+
+    // 1. Bad version in classic pcap (2.5 instead of 2.4)
+    expect_open_throws({0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x05, 0x00, 0, 0, 0, 0,
+                        0,    0,    0,    0,    0xff, 0xff, 0,    0,    1, 0, 0, 0});
+    // 2. Zero snaplen in classic pcap
+    expect_open_throws({0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0, 0, 0, 0,
+                        0,    0,    0,    0,    0,    0,    0,    0,    1, 0, 0, 0});
+    // 3. Unsupported linktype (99) in classic pcap
+    expect_open_throws({0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0,  0, 0, 0,
+                        0,    0,    0,    0,    0xff, 0xff, 0,    0,    99, 0, 0, 0});
+    // 4. Trailing partial packet record header (7 bytes after 24-byte header)
+    expect_open_throws({0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0xff, 0xff, 0,    0,    1,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0});
+    // 5. PCAPNG EPB with cap_len = 0xfffffff0 (uint32 wrap-around attempt)
+    expect_open_throws({
+        // SHB (28 bytes)
+        0x0a, 0x0d, 0x0d, 0x0a, 0x1c, 0x00, 0x00, 0x00, 0x4d, 0x3c, 0x2b, 0x1a, 0x01, 0x00, 0x00,
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x1c, 0x00, 0x00, 0x00,
+        // IDB (20 bytes)
+        0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00,
+        0x00, 0x14, 0x00, 0x00, 0x00,
+        // EPB (32 bytes, cap_len = 0xfffffff0)
+        0x06, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0xff, 0xff, 0xff, 0xf0, 0xff, 0xff, 0xff, 0x20, 0x00,
+        0x00, 0x00});
+
+    // 6. Truncated and odd-length dissector inputs across all protocol dissectors
+    lmshark::Capture corpus = shark.capture();
+    corpus.set_vlan(42);
+    corpus.arp_request(0.0, "02:11:22:33:44:55", "10.0.0.1", "10.0.0.2");
+    corpus.clear_vlan();
+    corpus.icmp_echo_request(0.0, "10.0.0.1", "10.0.0.2", 1, 1, 64, 16);
+    corpus.icmp_time_exceeded(0.0, "10.0.0.254", "10.0.0.1", "8.8.8.8", 64);
+    corpus.icmpv6_echo_request(0.0, "2001:db8::1", "2001:db8::2", 1, 1, 64, 16);
+    corpus.icmpv6_neighbor_solicit(0.0, "2001:db8::1", "2001:db8::2");
+    corpus.tcp_segment(0.0, "10.0.0.1", 1234, "10.0.0.2", 80, 1, 1, "SYN,ACK,ECE,CWR,NS", 65535,
+                       "abc");
+    corpus.tcp6_segment(0.0, "2001:db8::1", 1234, "2001:db8::2", 80, 1, 1, "PSH,ACK", 65535,
+                        "xyz");
+    corpus.udp_datagram(0.0, "10.0.0.1", 1234, "10.0.0.2", 5678, "payload");
+    corpus.udp6_datagram(0.0, "2001:db8::1", 1234, "2001:db8::2", 5678, "payload6");
+    corpus.dns_query(0.0, "10.0.0.1", 53000, "8.8.8.8", 1, "example.com", "A");
+    corpus.dns_response(0.0, "8.8.8.8", "10.0.0.1", 53000, 1, "example.com", "A", "93.184.216.34",
+                        0);
+    corpus.http_request(0.0, "10.0.0.1", 54000, "10.0.0.2", 80, 1, 1, "GET", "/index.html",
+                        "example.com", "");
+    corpus.http_response(0.0, "10.0.0.2", 80, "10.0.0.1", 54000, 1, 1, 200, "OK", "text/plain",
+                         "hi");
+    corpus.tls_client_hello(0.0, "10.0.0.1", 55000, "10.0.0.2", 443, 1, 1, "example.com", "1.3",
+                            "h2");
+    corpus.tls_server_hello(0.0, "10.0.0.2", 443, "10.0.0.1", 55000, 1, 1, "1.3", "h2", 0x1301);
+    corpus.dhcp_message(0.0, "DISCOVER", "02:11:22:33:44:55", "0.0.0.0", "0.0.0.0", "0.0.0.0", 1,
+                        "host1");
+    corpus.ntp_packet(0.0, "10.0.0.1", 123, "10.0.0.2", 4, 1, "GPS", 1700000000.0);
+    corpus.quic_initial(0.0, "10.0.0.1", 56000, "10.0.0.2", 443, "v1", "01020304", "05060708", 1,
+                        32);
+    corpus.quic_short(0.0, "10.0.0.1", 56000, "10.0.0.2", 443, "01020304", 2, 24);
+
+    // Every prefix length of every packet (including 0, 1, odd lengths) for linktype 1 and 101
+    lmshark::Capture trunc_cap = shark.capture();
+    for (const auto& pkt : corpus.packets()) {
+        for (size_t len = 0; len <= pkt.raw.size(); ++len) {
+            std::vector<uint8_t> sub(pkt.raw.begin(), pkt.raw.begin() + len);
+            trunc_cap.add_raw_packet(0.001, sub, static_cast<uint32_t>(len), 1, true);
+            trunc_cap.add_raw_packet(0.001, sub, static_cast<uint32_t>(len), 101, true);
+        }
+    }
+    trunc_cap.analyze();
+    CHECK(trunc_cap.packet_count() > 1000);
+}
+
 } // namespace
 
 int main() {
@@ -251,6 +549,10 @@ int main() {
     test_tcp_reassembly_retrans_and_rtt();
     test_pcap_and_pcapng_roundtrip_and_filters();
     test_binary_format_variants();
+    test_tcp_edge_cases_and_ecn_flags();
+    test_ipv4_and_ipv6_fragmentation_and_reassembly();
+    test_mixed_linktypes_and_dev_full();
+    test_malformed_captures_and_robustness();
     std::cout << "All lmshark core C++ tests passed.\n";
     return 0;
 }

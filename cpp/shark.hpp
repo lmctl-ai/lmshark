@@ -34,7 +34,7 @@ struct DissectedPacket {
     std::string arp_target_mac;
     std::string arp_target_ip;
 
-    // Layer 3: IPv4 & IPv6
+    // Layer 3: IPv4 (RFC 791) & IPv6 (RFC 8200)
     bool has_ipv4 = false;
     bool has_ipv6 = false;
     uint8_t ip_version = 0;
@@ -43,33 +43,45 @@ struct DissectedPacket {
     uint8_t ip_ttl = 0;
     uint8_t ip_proto = 0;
     uint16_t ip_id = 0;
-    uint16_t ip_len = 0;
+    uint32_t ip_len = 0;
     bool ip_checksum_ok = true;
+    bool ip_df = false;
+    bool ip_mf = false;
+    uint16_t ip_frag_offset = 0; // byte offset (8-octet units * 8)
+    uint32_t ip_frag_id = 0;     // 16-bit IPv4 ID or 32-bit IPv6 Fragment Header ID
+    bool ip_fragmented = false;
+    bool ip_reassembled = false;
+    uint32_t ip_reassembled_len = 0;
+    uint32_t ip_l4_offset = 0;
+    uint32_t ip_l4_len = 0;
+    std::vector<uint8_t> reassembled_l4;
 
-    // Layer 4: ICMP & ICMPv6
+    // Layer 4: ICMP (RFC 792) & ICMPv6 (RFC 4443 / RFC 4861)
     bool has_icmp = false;
     bool has_icmpv6 = false;
     uint8_t icmp_type = 0;
     uint8_t icmp_code = 0;
     uint16_t icmp_id = 0;
     uint16_t icmp_seq = 0;
+    bool icmp_checksum_ok = true;
 
-    // Layer 4: TCP
+    // Layer 4: TCP (RFC 9293 / RFC 3168 ECN)
     bool has_tcp = false;
     uint16_t tcp_srcport = 0;
     uint16_t tcp_dstport = 0;
     uint32_t tcp_seq = 0;
     uint32_t tcp_ack = 0;
-    uint8_t tcp_flags = 0;
+    uint16_t tcp_flags = 0; // FIN(0x01)..URG(0x20), ECE(0x40), CWR(0x80), NS(0x100)
     uint16_t tcp_window = 0;
     uint16_t tcp_hdr_len = 0;
     uint32_t tcp_payload_offset = 0;
     uint32_t tcp_payload_len = 0;
     bool tcp_checksum_ok = true;
 
-    // TCP conversation & sequence analysis
+    // TCP conversation & sequence analysis (RFC 9293 / RFC 1982 modular sequence arithmetic)
     int32_t tcp_stream = -1;
     bool tcp_from_initiator = true;
+    bool tcp_saw_syn = false;
     uint32_t tcp_rel_seq = 0;
     uint32_t tcp_rel_ack = 0;
     bool tcp_retransmission = false;
@@ -78,13 +90,14 @@ struct DissectedPacket {
     bool tcp_zero_window = false;
     double tcp_rtt_ms = 0.0;
 
-    // Layer 4: UDP
+    // Layer 4: UDP (RFC 768)
     bool has_udp = false;
     uint16_t udp_srcport = 0;
     uint16_t udp_dstport = 0;
     uint16_t udp_len = 0;
     uint32_t udp_payload_offset = 0;
     uint32_t udp_payload_len = 0;
+    bool udp_checksum_ok = true;
 
     // Layer 7: DNS
     bool has_dns = false;
@@ -156,6 +169,9 @@ struct DissectedPacket {
     bool flag_psh() const { return (tcp_flags & 0x08) != 0; }
     bool flag_ack() const { return (tcp_flags & 0x10) != 0; }
     bool flag_urg() const { return (tcp_flags & 0x20) != 0; }
+    bool flag_ece() const { return (tcp_flags & 0x40) != 0; }
+    bool flag_cwr() const { return (tcp_flags & 0x80) != 0; }
+    bool flag_ns() const { return (tcp_flags & 0x100) != 0; }
 };
 
 /// Packet capture container supporting pcap/pcapng I/O, synthetic packet building, protocol dissection, TCP stream reassembly, and Wireshark/BPF filtering.
@@ -171,6 +187,19 @@ public:
 
     /// Clear the IEEE 802.1Q VLAN tag for subsequently built packets.
     void clear_vlan();
+
+    /// Append a raw frame from hexadecimal bytes with the given linktype (1 = Ethernet, 101 = Raw IP).
+    void raw_frame(double ts, const std::string& hex_bytes, int64_t linktype);
+
+    /// Emit an IPv4 fragment (RFC 791) with explicit protocol, 16-bit identification, byte fragment offset (multiple of 8), MF flag, and hex payload.
+    void ipv4_fragment(double ts, const std::string& src_ip, const std::string& dst_ip,
+                       int64_t proto, int64_t ip_id, int64_t frag_offset_bytes,
+                       bool more_fragments, const std::string& payload_hex);
+
+    /// Emit an IPv6 fragment (RFC 8200 Next Header 44) with explicit upper-layer next_hdr, 32-bit identification, byte fragment offset (multiple of 8), MF flag, and hex payload.
+    void ipv6_fragment(double ts, const std::string& src_ip6, const std::string& dst_ip6,
+                       int64_t next_hdr, int64_t frag_id, int64_t frag_offset_bytes,
+                       bool more_fragments, const std::string& payload_hex);
 
     /// Emit an ARP Request frame asking who has target_ip.
     void arp_request(double ts, const std::string& sender_mac, const std::string& sender_ip,
@@ -371,6 +400,9 @@ public:
     /// Return the 802.1Q VLAN ID (or 0 if untagged) of packet at 0-based index idx.
     int64_t pkt_vlan(int64_t idx) const;
 
+    /// Return the link-layer encapsulation type (1 = Ethernet, 101 = Raw IP) of packet at 0-based index idx.
+    int64_t pkt_linktype(int64_t idx) const;
+
     /// Return the human-readable dissection summary line of packet at 0-based index idx.
     std::string pkt_info(int64_t idx) const;
 
@@ -436,7 +468,7 @@ public:
 
     // Internal C++ accessors for native tests and loader
     void add_raw_packet(double ts, const std::vector<uint8_t>& raw, uint32_t wire_len = 0,
-                        uint32_t linktype = 1);
+                        uint32_t linktype = 1, bool defer_analyze = false);
     void analyze();
     const std::vector<DissectedPacket>& packets() const { return packets_; }
 

@@ -45,6 +45,46 @@
             "returns": "void"
           }
         ],
+        "raw_frame": [
+          {
+            "params": [
+              "float",
+              "string",
+              "int"
+            ],
+            "returns": "void"
+          }
+        ],
+        "ipv4_fragment": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "int",
+              "int",
+              "int",
+              "bool",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "ipv6_fragment": [
+          {
+            "params": [
+              "float",
+              "string",
+              "string",
+              "int",
+              "int",
+              "int",
+              "bool",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
         "arp_request": [
           {
             "params": [
@@ -548,6 +588,14 @@
           }
         ],
         "pkt_len": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "int"
+          }
+        ],
+        "pkt_linktype": [
           {
             "params": [
               "int"

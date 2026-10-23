@@ -1,0 +1,106 @@
+# Reviewer-found regression suite: TCP analysis edge cases, IPv4/IPv6 fragment reassembly,
+# mixed link-type export, 9-bit TCP flags, L4 checksums, display filter precision, and
+# truncated/odd-length dissector inputs.
+
+p = _dsl_ cli="lmshark";
+
+# 1. TCP initiator selection when capture starts with SYN,ACK
+let synack_first = shark.capture();
+synack_first.tcp_segment(0.000, "10.0.0.2", 80, "10.0.0.1", 40000, 5001, 1000, "SYN,ACK", 65535, "");
+synack_first.tcp_segment(0.001, "10.0.0.1", 40000, "10.0.0.2", 80, 1000, 5002, "SYN", 65535, "");
+synack_first.tcp_segment(0.002, "10.0.0.1", 40000, "10.0.0.2", 80, 1001, 5002, "PSH,ACK", 65535, "HELLO");
+assert_eq(synack_first.tcp_stream_text(0, "client"), "HELLO");
+assert_eq(synack_first.tcp_stream_text(0, "server"), "");
+assert_close(synack_first.avg_rtt_ms(), 2.0, 0.01);
+
+# 2. 32-bit TCP sequence number wrap-around (0xfffffffa -> 0 -> 5)
+let wrap = shark.capture();
+wrap.tcp_segment(0.000, "10.0.0.1", 40000, "10.0.0.2", 80, 4294967290, 0, "SYN", 65535, "");
+wrap.tcp_segment(0.005, "10.0.0.2", 80, "10.0.0.1", 40000, 2000, 4294967291, "SYN,ACK", 65535, "");
+wrap.tcp_segment(0.010, "10.0.0.1", 40000, "10.0.0.2", 80, 4294967291, 2001, "ACK", 65535, "");
+wrap.tcp_segment(0.020, "10.0.0.1", 40000, "10.0.0.2", 80, 4294967291, 2001, "PSH,ACK", 65535, "ABCDE");
+wrap.tcp_segment(0.030, "10.0.0.1", 40000, "10.0.0.2", 80, 0, 2001, "PSH,ACK", 65535, "FGHIJ");
+wrap.tcp_segment(0.045, "10.0.0.2", 80, "10.0.0.1", 40000, 2001, 5, "ACK", 65535, "");
+assert_eq(wrap.out_of_order_count(), 0);
+assert_eq(wrap.retransmission_count(), 0);
+assert_eq(wrap.tcp_stream_text(0, "client"), "ABCDEFGHIJ");
+assert_eq(wrap.tcp_stream_bytes(0, "client"), 10);
+
+# 3. Midstream TCP reassembly without SYN (no off-by-one byte clipping)
+let mid = shark.capture();
+mid.tcp_segment(0.000, "10.0.0.1", 40000, "10.0.0.2", 80, 500, 900, "PSH,ACK", 65535, "AB");
+mid.tcp_segment(0.001, "10.0.0.1", 40000, "10.0.0.2", 80, 502, 900, "PSH,ACK", 65535, "CDEF");
+assert_eq(mid.tcp_stream_text(0, "client"), "ABCDEF");
+assert_eq(mid.tcp_stream_bytes(0, "client"), 6);
+
+# 4. Unrecovered TCP sequence gap marker
+let gap = shark.capture();
+gap.tcp_segment(0.000, "10.0.0.1", 40000, "10.0.0.2", 80, 1000, 0, "SYN", 65535, "");
+gap.tcp_segment(0.001, "10.0.0.1", 40000, "10.0.0.2", 80, 1001, 0, "PSH,ACK", 65535, "AB");
+gap.tcp_segment(0.002, "10.0.0.1", 40000, "10.0.0.2", 80, 1005, 0, "PSH,ACK", 65535, "EF");
+assert_eq(gap.tcp_stream_text(0, "client"), "AB[<2 bytes missing>]EF");
+assert_eq(gap.tcp_stream_bytes(0, "client"), 4);
+
+# 5. ECN/CWR/NS flags, L4 checksums, and display filter precision
+let flt = shark.capture();
+flt.udp_datagram(0.000, "10.0.0.1", 53, "10.0.0.2", 9999, "DNS");
+flt.tcp_segment(0.001, "10.0.0.1", 40000, "10.0.0.2", 80, 100, 0, "SYN,ECE,CWR,NS", 65535, "");
+flt.http_request(0.002, "10.0.0.1", 40001, "10.0.0.2", 80, 100, 0, "GET", "/Admin", "example.test", "");
+assert_eq(flt.pkt_field(0, "tcp.checksum_ok"), "");
+assert_eq(flt.pkt_field(0, "udp.checksum_ok"), "true");
+assert_eq(flt.pkt_field(1, "tcp.flags"), "SYN,ECE,CWR,NS");
+assert_eq(flt.filter("tcp.flags.syn == 0").packet_count(), 1);
+assert_eq(flt.filter("tcp.stream == -1").packet_count(), 0);
+assert_eq(flt.filter("tcp.checksum_ok").packet_count(), 2);
+assert_eq(flt.filter("http.uri == \"/admin\"").packet_count(), 0);
+assert_eq(flt.filter("http.uri == \"/Admin\"").packet_count(), 1);
+
+# 6. IPv4 and IPv6 fragmentation and reassembly
+let frags = shark.capture();
+frags.ipv4_fragment(0.001, "10.0.0.1", "10.0.0.2", 17, 4660, 0, true, "04d20035000e0000");
+frags.ipv4_fragment(0.002, "10.0.0.1", "10.0.0.2", 17, 4660, 8, false, "68656c6c6f21");
+assert_eq(frags.pkt_proto(0), "IPv4");
+assert_eq(frags.pkt_field(0, "ip.fragmented"), "true");
+assert_eq(frags.pkt_proto(1), "UDP");
+assert_eq(frags.pkt_field(1, "ip.reassembled"), "true");
+assert_eq(frags.pkt_field(1, "ip.reassembled_len"), "14");
+assert_eq(frags.pkt_srcport(1), 1234);
+assert_eq(frags.pkt_dstport(1), 53);
+
+let frags6 = shark.capture();
+frags6.ipv6_fragment(0.001, "2001:db8::1", "2001:db8::2", 17, 99999, 0, true, "04d20035000e0000");
+frags6.ipv6_fragment(0.002, "2001:db8::1", "2001:db8::2", 17, 99999, 8, false, "68656c6c6f21");
+assert_eq(frags6.pkt_proto(0), "IPv6");
+assert_eq(frags6.pkt_field(0, "ipv6.fragmented"), "true");
+assert_eq(frags6.pkt_proto(1), "UDP");
+assert_eq(frags6.pkt_field(1, "ipv6.reassembled"), "true");
+assert_eq(frags6.pkt_field(1, "ipv6.reassembled_len"), "14");
+
+# 7. Mixed link types preserved on PCAPNG export
+let mixed = shark.capture();
+mixed.udp_datagram(0.001, "10.0.0.1", 12345, "10.0.0.2", 54321, "eth");
+# Raw IPv4 ICMP Echo Request (28 bytes, linktype 101)
+mixed.raw_frame(0.002, "4500001c000100004001f9700a0000010a0000020800f7fd00010001", 101);
+assert_eq(mixed.pkt_linktype(0), 1);
+assert_eq(mixed.pkt_linktype(1), 101);
+mixed.save_pcapng("build/tests/mixed_linktypes.pcapng");
+let mixed_reopen = shark.open("build/tests/mixed_linktypes.pcapng");
+assert_eq(mixed_reopen.packet_count(), 2);
+assert_eq(mixed_reopen.pkt_linktype(0), 1);
+assert_eq(mixed_reopen.pkt_linktype(1), 101);
+assert_eq(mixed_reopen.pkt_proto(0), "UDP");
+assert_eq(mixed_reopen.pkt_proto(1), "ICMP");
+
+# 8. Truncated and odd-length raw frames do not crash or hang
+let trunc = shark.capture();
+trunc.raw_frame(0.001, "", 1);
+trunc.raw_frame(0.002, "ff", 1);
+trunc.raw_frame(0.003, "0200000000020200000000010800450000", 1);
+trunc.raw_frame(0.004, "45000014", 101);
+trunc.raw_frame(0.005, "6000000000103b40", 101);
+assert_eq(trunc.packet_count(), 5);
+
+end _dsl_
+savedsl(p, "build/tests/review_regressions.dslb");
+r = system ${dsl_cli(p)} --dsl build/tests/review_regressions.dslb;
+assert(r.code == 0);

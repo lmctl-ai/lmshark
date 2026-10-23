@@ -13,6 +13,8 @@ Every figure below is generated end-to-end by an executable `.lms` script in [`e
 | ![Stevens TCP Time-Sequence Graph](docs/images/tcp_stevens_graph.png)<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmshark/main/examples/tcp_stevens_graph.lms` | ![Multi-Protocol I/O Burst](docs/images/io_traffic_burst.png)<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmshark/main/examples/io_traffic_sweep.lms` | ![Protocol Hierarchy Breakdown](docs/images/protocol_hierarchy.png)<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmshark/main/examples/protocol_hierarchy.lms` |
 | **Multi-Tier TCP ACK RTT & Tail Latency Spike** | **IEEE 802.1Q VLAN Trunk Segmentation** | **WAN Handshake Head-Start: QUIC v2 vs TLS 1.3 vs TLS 1.2** |
 | ![TCP RTT Distribution](docs/images/rtt_distribution.png)<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmshark/main/examples/rtt_distribution.lms` | ![IEEE 802.1Q VLAN Segmentation](docs/images/vlan_segmentation.png)<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmshark/main/examples/gallery/vlan_segmentation.lms` | ![QUIC v2 vs TLS 1.3 vs TLS 1.2 Handshake](docs/images/quic_vs_tls_handshake.png)<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmshark/main/examples/gallery/quic_vs_tls_handshake.lms` |
+| **IPv4 & IPv6 Fragment Reassembly Forensics** | **TCP 32-Bit Sequence Wrap-Around & RFC 3168 ECN** | |
+| ![IPv4 and IPv6 Fragment Reassembly](docs/images/ip_fragment_reassembly.png)<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmshark/main/examples/gallery/ip_fragment_reassembly.lms` | ![TCP 32-Bit Sequence Wrap and ECN Control](docs/images/tcp_seqwrap_and_ecn.png)<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmshark/main/examples/gallery/tcp_seqwrap_and_ecn.lms` | |
 
 ---
 
@@ -80,6 +82,8 @@ Wireshark and `libwireshark` (`tshark`) are licensed under the **GNU General Pub
 
 ### `Capture` Packet Builders
 - `cap.set_macs(src_mac, dst_mac)` / `cap.set_vlan(vlan_id)` / `cap.clear_vlan()`
+- `cap.raw_frame(ts, hex_bytes, linktype)`
+- `cap.ipv4_fragment(ts, src_ip, dst_ip, proto, ip_id, frag_offset_bytes, more_fragments, payload_hex)` / `cap.ipv6_fragment(ts, src_ip6, dst_ip6, next_header, frag_id, frag_offset_bytes, more_fragments, payload_hex)`
 - `cap.arp_request(ts, sender_mac, sender_ip, target_ip)` / `cap.arp_reply(ts, sender_mac, sender_ip, target_mac, target_ip)`
 - `cap.icmp_echo_request(ts, src_ip, dst_ip, id, seq, ttl, payload_len)` / `cap.icmp_echo_reply(...)`
 - `cap.icmp_time_exceeded(ts, router_ip, dst_ip, orig_dst_ip, ttl)` / `cap.icmp_dest_unreachable(ts, router_ip, dst_ip, orig_dst_ip, code)`
@@ -97,7 +101,7 @@ Wireshark and `libwireshark` (`tshark`) are licensed under the **GNU General Pub
 
 ### `Capture` Dissection Queries, Filtering & Exports
 - **Metrics**: `packet_count()`, `total_bytes()`, `duration()`, `protocol_packets(proto)`, `protocol_bytes(proto)`, `tcp_stream_count()`, `retransmission_count()`, `out_of_order_count()`, `dup_ack_count()`, `avg_rtt_ms()`, `max_rtt_ms()`, `min_rtt_ms()`, `flow_count()`, `unique_hosts()`, `summary()`
-- **Per-packet inspection**: `pkt_time(idx)`, `pkt_len(idx)`, `pkt_proto(idx)`, `pkt_src(idx)`, `pkt_dst(idx)`, `pkt_srcport(idx)`, `pkt_dstport(idx)`, `pkt_vlan(idx)`, `pkt_info(idx)`, `pkt_field(idx, field)`
+- **Per-packet inspection**: `pkt_time(idx)`, `pkt_len(idx)`, `pkt_linktype(idx)`, `pkt_proto(idx)`, `pkt_src(idx)`, `pkt_dst(idx)`, `pkt_srcport(idx)`, `pkt_dstport(idx)`, `pkt_vlan(idx)`, `pkt_info(idx)`, `pkt_field(idx, field)`
 - **TCP Stream Reassembly**: `tcp_stream_text(stream_id, direction)`, `tcp_stream_bytes(stream_id, direction)`, `tcp_stream_packets(stream_id)`, `tcp_stream_retransmissions(stream_id)`, `tcp_stream_rtt_ms(stream_id)`
 - **Filtering & Slicing**: `filter(display_expr)`, `bpf(bpf_expr)`, `slice_time(t_start, t_end)`, `merge(other)`
 - **File & Telemetry Exports**: `save_pcap(path)`, `save_pcapng(path)`, `save_packets_csv(path)`, `save_flows_csv(path)`, `save_top_talkers_csv(path)`, `save_protocol_hierarchy_csv(path)`, `save_io_graph_csv(bucket_sec, path)`, `save_time_sequence_csv(stream_id, path)`, `save_json(path)`

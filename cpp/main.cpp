@@ -18,7 +18,7 @@
 #include <io.h>
 #endif
 #ifndef LMSHARK_VERSION
-#define LMSHARK_VERSION "0.1.0"
+#define LMSHARK_VERSION "0.1.1"
 #endif
 
 namespace {
@@ -127,6 +127,25 @@ void register_host(dslvm::Registry& r, Host& h) {
         C(p).clear_vlan();
         return Value::none();
     });
+    check(r, "Capture", "raw_frame", {"float", "string", "int"}, "void", [](void* p, Args& a) {
+        finite(a[0].f, "Capture.raw_frame");
+        C(p).raw_frame(a[0].f, a[1].s, a[2].i);
+        return Value::none();
+    });
+    check(r, "Capture", "ipv4_fragment",
+          {"float", "string", "string", "int", "int", "int", "bool", "string"}, "void",
+          [](void* p, Args& a) {
+              finite(a[0].f, "Capture.ipv4_fragment");
+              C(p).ipv4_fragment(a[0].f, a[1].s, a[2].s, a[3].i, a[4].i, a[5].i, a[6].b, a[7].s);
+              return Value::none();
+          });
+    check(r, "Capture", "ipv6_fragment",
+          {"float", "string", "string", "int", "int", "int", "bool", "string"}, "void",
+          [](void* p, Args& a) {
+              finite(a[0].f, "Capture.ipv6_fragment");
+              C(p).ipv6_fragment(a[0].f, a[1].s, a[2].s, a[3].i, a[4].i, a[5].i, a[6].b, a[7].s);
+              return Value::none();
+          });
 
     // Packet builders
     check(r, "Capture", "arp_request", {"float", "string", "string", "string"}, "void",
@@ -378,6 +397,9 @@ void register_host(dslvm::Registry& r, Host& h) {
     check(r, "Capture", "pkt_len", {"int"}, "int", [](void* p, Args& a) {
         return Value::integer(C(p).pkt_len(a[0].i));
     });
+    check(r, "Capture", "pkt_linktype", {"int"}, "int", [](void* p, Args& a) {
+        return Value::integer(C(p).pkt_linktype(a[0].i));
+    });
     check(r, "Capture", "pkt_proto", {"int"}, "string", [](void* p, Args& a) {
         return Value::string(C(p).pkt_proto(a[0].i));
     });
@@ -606,8 +628,10 @@ int main(int argc, char** argv) {
         try {
             programs.push_back(dslvm::Program::load(dslvm::read_file(file), schema, reg));
         } catch (const dslvm::Error& e) {
+            std::cerr << "lmshark: " << e.what() << '\n';
             return dslvm::report_error("load", e);
         } catch (const std::exception& e) {
+            std::cerr << "lmshark: " << e.what() << '\n';
             return dslvm::report_error("load", dslvm::Error(e.what()));
         }
     }
@@ -619,8 +643,14 @@ int main(int argc, char** argv) {
         try {
             p.run(ctx, reg);
         } catch (const dslvm::Error& e) {
+            if (std::string(e.what()).find("memory budget exceeded") == std::string::npos) {
+                std::cerr << "lmshark: " << e.what() << '\n';
+            }
             return dslvm::report_error("run", e);
         } catch (const std::exception& e) {
+            if (std::string(e.what()).find("memory budget exceeded") == std::string::npos) {
+                std::cerr << "lmshark: " << e.what() << '\n';
+            }
             return dslvm::report_error("run", dslvm::Error(e.what()));
         }
         dslvm::report_ok();
