@@ -37,6 +37,7 @@ ctest --test-dir "$BUILD_DIR" --output-on-failure >/dev/null || fail "native C++
 ok "native C++ protocol & pcap/pcapng regression tests"
 
 want_version="lmshark $(sed -n 's/^project(lmshark VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+[ "$want_version" = "lmshark 0.2.1" ] || fail "CMakeLists.txt version is not 0.2.1 ($want_version)"
 [ "$("$HOST" --version)" = "$want_version" ] || fail "--version is not exactly '$want_version'"
 ok "--version prints exactly '$want_version'"
 cp schema/lmshark.dsl.json "$WORK/schema.before"
@@ -49,10 +50,20 @@ diff -u <("$LMSCRIPT" --dsl-signatures schema/lmshark.dsl.json) <("$HOST" --dsl-
 ok "host registry matches compiler signatures"
 "$HOST" --notices | grep -q "MIT license" || fail "--notices missing MIT text"
 "$HOST" --notices | grep -q "GPL-3.0-with-GCC-exception" || fail "--notices missing runtime notice"
+"$HOST" --notices | grep -q "glibc >= 2.35" || fail "--notices missing dynamic glibc >= 2.35 notice"
 ok "--notices prints the license and runtime notices"
 
 case "$UNAME_S" in
-  Linux) if ldd "$HOST" >/dev/null 2>&1; then fail "executable is dynamically linked"; fi; ok "executable is fully static (no dynamic loader)";;
+  Linux)
+    if command -v readelf >/dev/null 2>&1; then
+      needed="$(readelf -d "$HOST" | awk '/\(NEEDED\)/ { gsub(/\[|\]/, "", $5); print $5 }')"
+    else
+      needed="$(ldd "$HOST" | awk '/=>/ { print $1 } /^\// { sub(/.*\//, "", $1); print $1 }')"
+    fi
+    [ -n "$needed" ] || fail "expected dynamic glibc linkage on Linux"
+    bad="$(printf '%s\n' "$needed" | grep -v -E '^(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|ld-linux.*\.so\.[0-9]+)$' || true)"
+    [ -z "$bad" ] || fail "unexpected Linux NEEDED libraries: $bad"
+    ok "Linux dynamic glibc allowlist only";;
   Darwin) bad="$(otool -L "$HOST" | tail -n +2 | grep -v -E '/usr/lib/(libSystem|libc\+\+|libresolv)' || true)"
           [ -z "$bad" ] || fail "non-system dylib dependencies: $bad"; ok "only system libraries linked";;
   MINGW*|MSYS*|CYGWIN*)

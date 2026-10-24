@@ -14,12 +14,11 @@ IEEE specifications.
 
 No code from Wireshark, libwireshark, tshark, tcpdump, or GPL/LGPL libraries is included or linked.
 
-Runtime libraries in static builds
-----------------------------------
-- Linux static builds link libstdc++/libgcc (GPL-3.0-with-GCC-exception, which permits static linking into
-  any MIT executable) and glibc (LGPL-2.1-or-later, which permits static linking provided the user can
-  relink against a modified glibc: the complete lmshark source and CMake build at
-  https://github.com/lmctl-ai/lmshark are public, so the binary can be rebuilt and relinked with any glibc;
-  glibc source at https://www.gnu.org/software/libc/).
-- Windows static builds link the MinGW-w64 runtime and winpthreads (Zope Public License / MIT / BSD / public
+Runtime libraries
+-----------------
+- Linux builds dynamically link the system glibc (LGPL-2.1, minimum dynamic glibc >= 2.35) and statically link
+  libstdc++/libgcc (GPL-3.0-with-GCC-exception, which permits static linking into any MIT executable).
+  Host source and CMake build recipes are published at https://github.com/lmctl-ai/lmshark.
+- Windows builds statically link the MinGW-w64 runtime and winpthreads (Zope Public License / MIT / BSD / public
   domain) and libstdc++/libgcc (GPL-3.0-with-GCC-exception).
+- macOS builds link only macOS system libraries and the system C++ runtime.

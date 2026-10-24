@@ -18,7 +18,7 @@
 #include <io.h>
 #endif
 #ifndef LMSHARK_VERSION
-#define LMSHARK_VERSION "0.2.0"
+#define LMSHARK_VERSION "0.2.1"
 #endif
 
 namespace {

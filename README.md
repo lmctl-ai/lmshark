@@ -1,6 +1,6 @@
 # lmshark
 
-Packet capture analysis as a script: read and write `.pcap`/`.pcapng`, build exact packets, dissect them, follow TCP streams and filter with Wireshark-style expressions. MIT, one static binary, no Wireshark or GPL code.
+Packet capture analysis as a script: read and write `.pcap`/`.pcapng`, build exact packets, dissect them, follow TCP streams and filter with Wireshark-style expressions. MIT, one self-contained binary (dynamic glibc >= 2.35 on Linux, static C++/MinGW runtimes), no Wireshark or GPL code.
 
 ### TCP, packet by packet
 
@@ -39,7 +39,7 @@ Run the command under a picture in an empty directory; the PNG lands in `images/
 
 ## Quickstart (1 minute)
 
-Install [lmctl](https://github.com/lmctl-ai/lmscript) and run any caption above, or write a script:
+Install [lmctl](https://github.com/lmctl-ai/lmscript) and run any caption above (on Linux x64/arm64, release binaries require dynamic glibc >= 2.35 and statically link libstdc++/libgcc; macOS arm64/x64 and Windows x64 require no extra runtime packages), or write a script:
 
 ```lms
 p = _dsl_ cli="lmshark" install="github:lmctl-ai/lmshark@latest";
